@@ -1,6 +1,6 @@
 # Changelog
 
-## [2.0.0] - 2024-12-23
+## [2.0.0] - 2025-12-23
 
 ### Initial Release
 - Forked from kdl-nim with 98.4% KDL 2.0 spec compliance (673/684 tests)

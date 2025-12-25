@@ -279,6 +279,17 @@ proc escapedChar(p: Parser): ParseResult[string] =
     except:
       p.addError("Invalid Unicode escape")
       return failure[string]()
+  of ' ', '\t', '\n', '\r':
+    # Whitespace escape: backslash followed by whitespace consumes all following whitespace
+    # This is used for line continuation in strings
+    # The backslash and all following whitespace are discarded
+    while not p.atEnd():
+      let ch = p.source[p.pos]
+      if ch in {' ', '\t', '\n', '\r'}:
+        p.advance()
+      else:
+        break
+    return success("", p.pos)
   else:
     p.addError("Invalid escape sequence: \\" & $c)
     return failure[string]()

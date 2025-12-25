@@ -195,14 +195,18 @@ proc escline(p: Parser): ParseResult[string] =
     escape.add(slcRes.value)
 
   let nlRes = newline(p)
-  if not nlRes.ok:
-    p.pos = start
-    return failure[string]()
+  if nlRes.ok:
+    escape.add(nlRes.value)
+    escape.add(wss(p))
+    return success(escape, p.pos)
 
-  escape.add(nlRes.value)
-  escape.add(wss(p))
+  # If no newline but at EOF, escline is still valid
+  if p.atEnd():
+    return success(escape, p.pos)
 
-  return success(escape, p.pos)
+  # Not followed by newline or EOF - invalid escline
+  p.pos = start
+  return failure[string]()
 
 proc nodeSpace(p: Parser): ParseResult[string] =
   ## Parses node-space: (ws* escline ws*) | ws+
@@ -1367,6 +1371,16 @@ proc nodes(p: Parser): ParseResult[seq[InternalNode]] =
 
   # Parse nodes
   while not p.atEnd():
+    # Skip line-space and escline between nodes
+    while true:
+      let lsRes = lineSpace(p)
+      if lsRes.ok:
+        continue
+      let escRes = escline(p)
+      if escRes.ok:
+        continue
+      break
+
     # Check for slashdashed nodes before trying to parse a real node
     while true:
       let sdRes = slashdash(p)

@@ -444,6 +444,21 @@ proc quotedString(p: Parser): ParseResult[KdlVal] =
       # Check for closing """
       if c == '"':
         if p.peekStr(3).isSome and p.peekStr(3).get == "\"\"\"":
+          # KDL v2: The closing delimiter line must only contain whitespace before """
+          # Check if currentLine has any non-whitespace content
+          var hasNonWhitespace = false
+          var pos = 0
+          while pos < currentLine.len:
+            let r = currentLine.runeAt(pos)
+            if not isUnicodeSpace(r):
+              hasNonWhitespace = true
+              break
+            pos += r.size
+
+          if hasNonWhitespace:
+            p.addError("Closing delimiter line must only contain whitespace before \"\"\"")
+            return failure[KdlVal]()
+
           p.advance(3)
           # Add the current line (might be closing line with indent)
           lines.add(currentLine)
@@ -484,8 +499,9 @@ proc quotedString(p: Parser): ParseResult[KdlVal] =
               # Non-empty line starting with indent - remove indent
               dedented.add(line[indent.len .. ^1])
             else:
-              # Non-empty line not starting with indent - keep as-is
-              dedented.add(line)
+              # KDL v2: Non-empty line MUST start with the exact prefix
+              p.addError("Multiline string line does not start with required indentation prefix")
+              return failure[KdlVal]()
 
           # Per KDL v2 spec: resolve non-whitespace escapes AFTER dedentation
           let dedentedStr = dedented.join("\n")
@@ -644,8 +660,9 @@ proc rawString(p: Parser): ParseResult[KdlVal] =
         # Non-empty line starting with indent - remove indent
         dedented.add(line[indent.len .. ^1])
       else:
-        # Non-empty line not starting with indent - keep as-is
-        dedented.add(line)
+        # KDL v2: Non-empty line MUST start with the exact prefix
+        p.addError("Multiline raw string line does not start with required indentation prefix")
+        return failure[KdlVal]()
 
     return success(initKString(dedented.join("\n")), p.pos)
 
@@ -1481,6 +1498,7 @@ proc baseNode(p: Parser): ParseResult[InternalNode] =
   var entries: seq[InternalEntry] = @[]
   var children: Option[seq[InternalNode]] = none(seq[InternalNode])
   var beforeChildren = ""
+  var hasRealChildren = false  # Track if we've seen a real (non-slashdashed) children block
 
   # Parse entries and children
   while true:
@@ -1521,7 +1539,11 @@ proc baseNode(p: Parser): ParseResult[InternalNode] =
             continue
           break
         discard nodeChildren(p)
-        # Continue to check for more children blocks (could be more slashdashed or real)
+        # Even though children are slashdashed, mark that children block was encountered
+        # This enforces the ordering constraint: no arguments/properties after children
+        if not children.isSome:
+          children = some(newSeq[InternalNode]())
+        # Continue to check for more slashdashed or real children blocks
         continue
     else:
       # No whitespace - but check for slashdash without preceding whitespace
@@ -1544,25 +1566,23 @@ proc baseNode(p: Parser): ParseResult[InternalNode] =
           if escline(p).ok:
             continue
           break
-        # KDL v2: A node can only have ONE children block (even with slashdash)
-        if children.isSome:
-          p.addError("Node cannot have multiple children blocks")
-          return failure[InternalNode]()
         discard nodeChildren(p)
-        # Even though children are slashdashed, mark that children have been encountered
+        # Even though children are slashdashed, mark that children block was encountered
         # This enforces the ordering constraint: no arguments/properties after children
-        children = some(newSeq[InternalNode]())  # Empty children to indicate children block was present
-        # Continue to check for more children blocks
+        if not children.isSome:
+          children = some(newSeq[InternalNode]())
+        # Continue to check for more slashdashed or real children blocks
         continue
 
       # Try children without preceding whitespace
       let childrenRes = nodeChildren(p)
       if childrenRes.ok:
-        # KDL v2: A node can only have ONE children block
-        if children.isSome:
+        # KDL v2: A node can only have ONE real (non-slashdashed) children block
+        if hasRealChildren:
           p.addError("Node cannot have multiple children blocks")
           return failure[InternalNode]()
         children = some(childrenRes.value)
+        hasRealChildren = true
 
         # After children block, validate that what follows is a valid terminator
         # (whitespace, newline, semicolon, EOF, or closing brace)

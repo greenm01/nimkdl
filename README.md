@@ -9,10 +9,27 @@ A KDL 2.0 document parser for Nim.
 ## Features
 
 - **100% KDL 2.0 Spec Compliance** (670/670 official tests passing)
+- **High Performance** (2.3x faster than kdl-rs in benchmarks)
 - **Full Unicode Support** (identifiers, whitespace, escapes)
 - **Robust Parsing** (multiline strings, slashdash, type annotations)
 - **Encoder/Decoder** (serialize Nim objects to/from KDL)
 - **Minimal Dependencies** (graphemes, unicodedb, bigints)
+
+## Performance
+
+nimkdl is highly optimized for speed while maintaining 100% spec compliance:
+
+- **2.3x faster** than kdl-rs (Rust) overall throughput
+- **10.8K operations/sec** average (vs 4.7K for kdl-rs)
+- **27.8K ops/s** on small files (Cargo.kdl)
+- **33-55% faster** on typical configuration files
+
+Optimizations include zero-copy string slicing, direct integer parsing, ASCII fast-paths, and aggressive compiler optimizations. See [BENCHMARK_COMPARISON.md](BENCHMARK_COMPARISON.md) for detailed results.
+
+**Run benchmarks:**
+```bash
+nim c -r -d:release benchmark.nim
+```
 
 ## Installation
 

@@ -105,7 +105,7 @@ proc isUnicodeSpace*(r: Rune): bool =
   ## Returns true if rune is a Unicode whitespace character recognized by KDL
   let c = r.int32
   case c
-  of 0x0009,  # CHARACTER TABULATION
+  of 0x0009,  # CHARACTER TABULATION (horizontal tab)
      0x0020,  # SPACE
      0x00A0,  # NO-BREAK SPACE
      0x1680,  # OGHAM SPACE MARK
@@ -130,8 +130,8 @@ proc isUnicodeSpace*(r: Rune): bool =
 proc isDisallowedCodePoint*(r: Rune): bool =
   ## Returns true if rune is disallowed in KDL
   let c = r.int32
-  # Control characters (except tab and newlines), BOM, etc.
-  if c >= 0x0000 and c <= 0x001F and c != 0x0009 and c != 0x000A and c != 0x000D:
+  # Control characters (except tab, vertical tab, and newlines), BOM, etc.
+  if c >= 0x0000 and c <= 0x001F and c notin [0x0009, 0x000B, 0x000A, 0x000D]:
     return true
   if c >= 0x007F and c <= 0x009F:
     return true
@@ -146,7 +146,7 @@ proc isDisallowedCodePoint*(r: Rune): bool =
 proc isIdentifierChar*(c: char): bool =
   ## Returns true if character is valid in a KDL identifier (after first position)
   ## Digits are allowed, but not as the first character (checked separately)
-  c notin {'(', ')', '{', '}', '[', ']', ';', '=', '"', '\\', '#', ' ', '\t', '\n', '\r'}
+  c notin {'(', ')', '{', '}', '[', ']', ';', '=', '"', '\\', '#', ' ', '\t', '\v', '\n', '\r'}
 
 # Basic parsers
 

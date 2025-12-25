@@ -23,6 +23,11 @@ proc parseDecimalDigits(p: Parser, allowSign: bool = true): ParseResult[string] 
   if allowSign and not p.atEnd() and p.source[p.pos] in {'+', '-'}:
     numStr.add(p.source[p.pos])
     p.advance()
+
+  # Must start with a digit (not underscore)
+  if p.atEnd() or p.source[p.pos] notin Digits:
+    return ParseResult[string](ok: false)
+
   let digitStart = p.pos
   while not p.atEnd():
     let c = p.source[p.pos]

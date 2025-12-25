@@ -19,8 +19,10 @@ requires "unicodedb == 0.13.0"
 when not defined(debug):
   switch("opt", "speed")
   switch("define", "danger")
-  switch("passC", "-march=native")
-  switch("passC", "-ffast-math")
+  # Platform-specific optimizations
+  when defined(gcc) or defined(clang):
+    switch("passC", "-march=native")
+    switch("passC", "-ffast-math")
 
 task docs, "Generate documentation":
   # We create the prefs module documentation separately because it is not imported in the main kdl file as it's not backed:js friendly

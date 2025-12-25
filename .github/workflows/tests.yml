@@ -11,8 +11,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v3
-      - uses: jiro4989/setup-nim-action@v1
+      - uses: alaviss/setup-nim@0.1.1
         with:
-          nim-version: '2.0.0'
+          path: nim
+          version: 2.0.0
       - run: nimble install -y --verbose
       - run: nimble test --verbose

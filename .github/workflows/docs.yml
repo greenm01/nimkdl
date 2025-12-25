@@ -11,10 +11,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@v3
-      - uses: alaviss/setup-nim@0.1.1
+      - name: Cache nimble
+        uses: actions/cache@v3
         with:
-          path: nim
-          version: 2.0.0
+          path: ~/.nimble
+          key: ${{ runner.os }}-nimble-${{ hashFiles('*.nimble') }}
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.0.0'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Generate
         run: |
           nimble install -d -y

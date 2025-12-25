@@ -682,31 +682,64 @@ proc rawString(p: Parser): ParseResult[KdlVal] =
     return failure[KdlVal]()
 
 proc identifierString(p: Parser): ParseResult[KdlVal] =
-  ## Parses an identifier as a bare string
+  ## Parses an identifier as a bare string (Unicode-aware)
   let start = p.pos
 
   if p.atEnd():
     return failure[KdlVal]()
 
-  # Identifier must not start with digit or certain chars
-  let first = p.source[p.pos]
-  if not isIdentifierChar(first) or first in Digits:
+  # Parse first rune - identifier must not start with digit
+  let firstRune = p.source.runeAt(p.pos)
+
+  # Check if first character is valid
+  if isDisallowedCodePoint(firstRune):
     return failure[KdlVal]()
+
+  if isUnicodeSpace(firstRune):
+    return failure[KdlVal]()
+
+  # Check for ASCII disallowed characters
+  let firstChar = firstRune.int32
+  if firstChar < 128:
+    let c = char(firstChar)
+    if c in {'(', ')', '{', '}', '[', ']', ';', '=', '"', '\\', '#', '/', ' ', '\t', '\v', '\n', '\r'}:
+      return failure[KdlVal]()
+    if c in Digits:
+      return failure[KdlVal]()
 
   var ident = ""
   while not p.atEnd():
-    let c = p.source[p.pos]
-
     # Check for comment starts: // or /*
-    if c == '/':
+    if p.source[p.pos] == '/':
       let next = p.peek()
       if next.isSome and next.get in {'/', '*'}:
         # Stop before comment
         break
 
-    if isIdentifierChar(c):
-      ident.add(c)
-      p.advance()
+    # Parse rune
+    let r = p.source.runeAt(p.pos)
+    let runeChar = r.int32
+
+    # Check if this rune is allowed in identifiers
+    var isValid = true
+
+    # Check for disallowed code points
+    if isDisallowedCodePoint(r):
+      isValid = false
+    # Check for Unicode whitespace
+    elif isUnicodeSpace(r):
+      isValid = false
+    # Check for ASCII disallowed characters
+    elif runeChar < 128:
+      let c = char(runeChar)
+      if c in {'(', ')', '{', '}', '[', ']', ';', '=', '"', '\\', '#', '/', ' ', '\t', '\v', '\n', '\r'}:
+        isValid = false
+
+    if isValid:
+      # Add the UTF-8 bytes for this rune
+      for i in 0 ..< r.size:
+        ident.add(p.source[p.pos + i])
+      p.pos += r.size
     else:
       break
 

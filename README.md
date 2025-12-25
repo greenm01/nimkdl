@@ -17,7 +17,7 @@ A KDL 2.0 document parser for Nim.
 ## Installation
 
 ```bash
-nimble install kdl
+nimble install nimkdl
 ```
 
 ## Quick Start

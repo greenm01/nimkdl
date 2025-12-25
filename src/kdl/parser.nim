@@ -1223,7 +1223,8 @@ proc baseNode(p: Parser): ParseResult[InternalNode] =
             continue
           break
         discard nodeChildren(p)
-        break
+        # Continue to check for more children blocks (could be more slashdashed or real)
+        continue
     else:
       # No whitespace - but check for slashdash without preceding whitespace
       # This allows: node "arg"/-otherarg
@@ -1246,7 +1247,8 @@ proc baseNode(p: Parser): ParseResult[InternalNode] =
             continue
           break
         discard nodeChildren(p)
-        break
+        # Continue to check for more children blocks
+        continue
 
       # Try children without preceding whitespace
       let childrenRes = nodeChildren(p)
@@ -1268,8 +1270,12 @@ proc baseNode(p: Parser): ParseResult[InternalNode] =
             break
           # Parse and discard the slashdashed children
           discard nodeChildren(p)
+          # Continue to check for more slashdashed children with whitespace
+          continue
 
-        break
+        # No immediate slashdash, but continue loop to check for slashdashed children with whitespace
+        # This allows: node { three } /-{ four } where there's space between them
+        continue
 
       # No entry or children, just whitespace - break
       p.pos = savedPos

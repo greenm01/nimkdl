@@ -237,7 +237,6 @@ proc resolveEscapeSequence(escSeq: string): string =
   of 'r': return "\r"
   of 't': return "\t"
   of '\\': return "\\"
-  of '/': return "/"
   of '"': return "\""
   of 'b': return "\b"
   of 'f': return "\f"
@@ -268,7 +267,7 @@ proc resolveNonWhitespaceEscapes(s: string): string =
     if s[i] == '\\' and i + 1 < s.len:
       # Check if this is an escape we should resolve
       let next = s[i + 1]
-      if next in {'n', 'r', 't', '\\', '/', '"', 'b', 'f', 's', 'u'}:
+      if next in {'n', 'r', 't', '\\', '"', 'b', 'f', 's', 'u'}:
         # Find the full escape sequence
         var escSeq = "\\"
         i += 1
@@ -323,7 +322,7 @@ proc escapedCharMultiline(p: Parser): ParseResult[string] =
   p.advance()
 
   # Validate it's a known escape sequence
-  if c in {'n', 'r', 't', '\\', '/', '"', 'b', 'f', 's'}:
+  if c in {'n', 'r', 't', '\\', '"', 'b', 'f', 's'}:
     return success("\\" & $c, p.pos)
   elif c == 'u':
     # Store \u{...} literally
@@ -359,7 +358,6 @@ proc escapedChar(p: Parser): ParseResult[string] =
   of 'r': return success("\r", p.pos)
   of 't': return success("\t", p.pos)
   of '\\': return success("\\", p.pos)
-  of '/': return success("/", p.pos)
   of '"': return success("\"", p.pos)
   of 'b': return success("\b", p.pos)
   of 'f': return success("\f", p.pos)

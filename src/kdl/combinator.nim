@@ -146,7 +146,7 @@ proc isDisallowedCodePoint*(r: Rune): bool =
 proc isIdentifierChar*(c: char): bool =
   ## Returns true if character is valid in a KDL identifier (after first position)
   ## Digits are allowed, but not as the first character (checked separately)
-  c notin {'(', ')', '{', '}', '[', ']', ';', '=', ',', '"', '\\', '#', ' ', '\t', '\n', '\r'}
+  c notin {'(', ')', '{', '}', '[', ']', ';', '=', '"', '\\', '#', ' ', '\t', '\n', '\r'}
 
 # Basic parsers
 

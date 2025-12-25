@@ -996,8 +996,18 @@ proc nodeEntry(p: Parser): ParseResult[Option[InternalEntry]] =
   let slashdashRes = slashdash(p)
   if slashdashRes.ok:
     # Slashdashed entry - parse but don't return it
-    # First consume whitespace after slashdash
-    discard nodeSpace(p)
+    # Consume whitespace/newlines after slashdash (could be on next line)
+    while true:
+      let nsRes = nodeSpace(p)
+      if nsRes.ok:
+        continue
+      let nlRes = newline(p)
+      if nlRes.ok:
+        continue
+      let lsRes = lineSpace(p)
+      if lsRes.ok:
+        continue
+      break
 
     # Check if it's a children block (not an entry)
     if not p.atEnd() and p.source[p.pos] == '{':

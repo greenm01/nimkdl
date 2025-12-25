@@ -704,6 +704,11 @@ proc identifierString(p: Parser): ParseResult[KdlVal] =
       return failure[KdlVal]()
     if c in Digits:
       return failure[KdlVal]()
+    # Check for dot followed by digit (looks like malformed float: .0, .123)
+    if c == '.':
+      let nextPos = p.pos + 1
+      if nextPos < p.source.len and p.source[nextPos] in Digits:
+        return failure[KdlVal]()
 
   var ident = ""
   while not p.atEnd():
@@ -846,6 +851,12 @@ proc parseHexNumber(p: Parser): ParseResult[BigInt] =
   if not p.tryStr("0x").ok:
     return failure[BigInt]()
 
+  # Check for underscore immediately after prefix (KDL v2 spec violation)
+  if not p.atEnd() and p.source[p.pos] == '_':
+    p.pos = start
+    p.addError("Underscore cannot immediately follow hex prefix '0x'")
+    return failure[BigInt]()
+
   var hexStr = ""
   while not p.atEnd():
     let c = p.source[p.pos]
@@ -854,6 +865,12 @@ proc parseHexNumber(p: Parser): ParseResult[BigInt] =
       p.advance()
     elif c == '_':
       p.advance()
+    elif c in {'g'..'z', 'G'..'Z'} or c in Digits:
+      # Invalid character in hex literal (KDL v2 spec violation)
+      # This catches cases like 0x10g10 where 'g' is not a valid hex digit
+      p.pos = start
+      p.addError("Invalid character '" & c & "' in hexadecimal number (valid: 0-9, a-f, A-F)")
+      return failure[BigInt]()
     else:
       break
 
@@ -885,6 +902,12 @@ proc parseOctalNumber(p: Parser): ParseResult[BigInt] =
   if not p.tryStr("0o").ok:
     return failure[BigInt]()
 
+  # Check for underscore immediately after prefix (KDL v2 spec violation)
+  if not p.atEnd() and p.source[p.pos] == '_':
+    p.pos = start
+    p.addError("Underscore cannot immediately follow octal prefix '0o'")
+    return failure[BigInt]()
+
   var octStr = ""
   while not p.atEnd():
     let c = p.source[p.pos]
@@ -893,6 +916,16 @@ proc parseOctalNumber(p: Parser): ParseResult[BigInt] =
       p.advance()
     elif c == '_':
       p.advance()
+    elif c in {'8', '9'}:
+      # Invalid octal digit (KDL v2 spec violation)
+      p.pos = start
+      p.addError("Invalid digit '" & c & "' in octal number (valid: 0-7)")
+      return failure[BigInt]()
+    elif c in {'a'..'z', 'A'..'Z'} or c in Digits:
+      # Invalid character in octal literal
+      p.pos = start
+      p.addError("Invalid character '" & c & "' in octal number")
+      return failure[BigInt]()
     else:
       break
 
@@ -921,6 +954,12 @@ proc parseBinaryNumber(p: Parser): ParseResult[BigInt] =
   if not p.tryStr("0b").ok:
     return failure[BigInt]()
 
+  # Check for underscore immediately after prefix (KDL v2 spec violation)
+  if not p.atEnd() and p.source[p.pos] == '_':
+    p.pos = start
+    p.addError("Underscore cannot immediately follow binary prefix '0b'")
+    return failure[BigInt]()
+
   var binStr = ""
   while not p.atEnd():
     let c = p.source[p.pos]
@@ -929,6 +968,11 @@ proc parseBinaryNumber(p: Parser): ParseResult[BigInt] =
       p.advance()
     elif c == '_':
       p.advance()
+    elif c in {'2'..'9'} or c in {'a'..'z', 'A'..'Z'}:
+      # Invalid character in binary literal (KDL v2 spec violation)
+      p.pos = start
+      p.addError("Invalid character '" & c & "' in binary number (valid: 0-1)")
+      return failure[BigInt]()
     else:
       break
 
@@ -963,23 +1007,44 @@ proc parseFloat(p: Parser): ParseResult[KdlVal] =
 
   # Must have decimal point or exponent
   var hasDecimalOrExp = false
+  var hasDot = false
 
   # Optional decimal point + fractional part
   if not p.atEnd() and p.source[p.pos] == '.':
     hasDecimalOrExp = true
+    hasDot = true
     floatStr.add('.')
     p.advance()
 
+    # Check for underscore immediately after decimal point (KDL v2 spec violation)
+    if not p.atEnd() and p.source[p.pos] == '_':
+      p.pos = start
+      p.addError("Underscore cannot immediately follow decimal point")
+      return failure[KdlVal]()
+
     # Fractional digits
+    var hasFractionDigits = false
     while not p.atEnd():
       let c = p.source[p.pos]
       if c in Digits:
         floatStr.add(c)
+        hasFractionDigits = true
         p.advance()
       elif c == '_':
         p.advance()
+      elif c == '.':
+        # Multiple dots in float (KDL v2 spec violation)
+        p.pos = start
+        p.addError("Multiple decimal points not allowed in number")
+        return failure[KdlVal]()
       else:
         break
+
+    # Decimal point must be followed by at least one digit (reject "1." or "1.e7")
+    if not hasFractionDigits:
+      p.pos = start
+      p.addError("Decimal point must be followed by digits")
+      return failure[KdlVal]()
 
   # Optional exponent
   if not p.atEnd() and p.source[p.pos] in {'e', 'E'}:
@@ -1002,6 +1067,11 @@ proc parseFloat(p: Parser): ParseResult[KdlVal] =
         p.advance()
       elif c == '_':
         p.advance()
+      elif c in {'e', 'E'}:
+        # Multiple exponents in float (KDL v2 spec violation)
+        p.pos = start
+        p.addError("Multiple exponent markers not allowed in number")
+        return failure[KdlVal]()
       else:
         break
 

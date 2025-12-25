@@ -1212,7 +1212,23 @@ proc baseNode(p: Parser): ParseResult[InternalNode] =
         discard nodeSpace(p)
         discard nodeChildren(p)
         break
+    else:
+      # No whitespace - but check for slashdash without preceding whitespace
+      # This allows: node "arg"/-otherarg
+      let sdRes = slashdash(p)
+      if sdRes.ok:
+        # Parse and discard the slashdashed entry
+        let entryRes = nodeEntry(p)
+        if entryRes.ok:
+          # Successfully consumed slashdashed entry, continue
+          continue
+        # If entry parsing failed, could be slashdashed children
+        p.pos = savedPos + 2  # Skip past '/-'
+        discard nodeSpace(p)
+        discard nodeChildren(p)
+        break
 
+      # Try children without preceding whitespace
       let childrenRes = nodeChildren(p)
       if childrenRes.ok:
         children = some(childrenRes.value)
@@ -1220,20 +1236,6 @@ proc baseNode(p: Parser): ParseResult[InternalNode] =
 
       # No entry or children, just whitespace - break
       p.pos = savedPos
-      break
-    else:
-      # No more node-space, but still try children (can appear without space)
-      # Check for slashdash before children
-      let sdRes = slashdash(p)
-      if sdRes.ok:
-        # Slashdashed children - parse and discard
-        discard nodeSpace(p)
-        discard nodeChildren(p)
-        break
-
-      let childrenRes = nodeChildren(p)
-      if childrenRes.ok:
-        children = some(childrenRes.value)
       break
 
   let format = some(KdlNodeFormat(

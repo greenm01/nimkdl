@@ -390,6 +390,10 @@ proc escapedChar(p: Parser): ParseResult[string] =
       if codepoint > 0x10FFFF:
         p.addError("Unicode code point too large")
         return failure[string]()
+      # KDL v2 spec: Reject Unicode surrogates (U+D800-U+DFFF)
+      if codepoint >= 0xD800 and codepoint <= 0xDFFF:
+        p.addError("Unicode surrogates (U+D800..U+DFFF) not allowed in escape sequences")
+        return failure[string]()
       let rune = Rune(codepoint)
       if isDisallowedCodePoint(rune):
         p.disallowedCodePointError(rune)

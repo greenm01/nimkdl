@@ -1,5 +1,6 @@
 ## This module implements initializers, comparision, getters, setters, operatores and macros to manipilate `KdlVal`, `KdlNode` and `KdlDoc`.
 import std/[strformat, strutils, options, tables, macros, math]
+import bigints
 
 import types, utils
 
@@ -122,6 +123,9 @@ proc initKUInt32*(val: uint32 = uint32.default, tag = string.none): KdlVal =
 
 proc initKUInt64*(val: uint64 = uint64.default, tag = string.none): KdlVal =
   initKVal(val, tag)
+
+proc initKBigInt*(val: BigInt, tag = string.none): KdlVal =
+  KdlVal(tag: tag, kind: KBigInt, bigint: val)
 
 proc initKDate*(val: string = string.default, tag = string.none): KdlVal =
   initKVal(val, KDate, tag)

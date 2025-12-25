@@ -1,7 +1,11 @@
-import std/[xmlparser, unittest, xmltree, json, os]
+import std/[xmlparser, unittest, xmltree, json, os, streams]
 
 import kdl
 import kdl/[schema, query, jik, xik]
+
+# Alias the new parser to the old names for the test suite
+proc parseKdlFile(path: string): KdlDoc = parseKdl(readFile(path))
+proc parseKdlFileStream(path: string): KdlDoc = parseKdl(readFile(path))
 
 let testsDir = getAppDir() / "test_cases"
 

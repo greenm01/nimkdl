@@ -114,10 +114,10 @@ runnableExamples:
 import std/[algorithm, enumerate, strformat, strutils, sequtils, options, tables, math]
 import bigints
 
-import kdl/[decoder, encoder, parser, lexer, nodes, types, utils, xik, jik]
+import kdl/[decoder, encoder, parser, nodes, types, utils, xik, jik]
 
 export decoder, encoder, parser, nodes, types
-export scanKdl, scanKdlFile, lexer.`$` # lexer
+export parseKdl # parser main entry point
 
 func indent(s: string, count: Natural, padding = " ", newLine = "\n"): string =
   for e, line in enumerate(s.splitLines):

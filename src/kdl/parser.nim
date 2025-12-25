@@ -1,861 +1,1361 @@
-import std/[parseutils, strformat, strutils, unicode, options, streams, tables, macros]
+## KDL v2 Parser - Single-pass recursive descent parser
+##
+## This is a complete rewrite of the KDL parser based on kdl-rs's proven
+## architecture. It uses a hand-rolled recursive descent approach that closely
+## mirrors the Winnow combinator patterns from kdl-rs.
+
+import std/[strutils, parseutils, unicode, options, strformat, tables]
 import bigints
-import lexer, nodes, types, utils
-# TODO: add parseKdlVal
-type
-  None = object
+import ./types
+import ./nodes
+import ./format
+import ./combinator
+import ./new_error
+import ./internal_types
 
-  Parser* = object
-    case isStream*: bool
-    of true:
-      stream*: Stream
-    else:
-      source*: string
+# Forward declarations
+proc nodes(p: Parser): ParseResult[seq[InternalNode]]
 
-    # Indexes and length of new lines in multiline strings that have to be converted to a single \n
-    multilineStringsNewLines*: seq[tuple[idx, length: int]]
-    stack*: seq[Token]
-    current*: int
+# Helper functions moved to top to avoid type inference issues
 
-  Match[T] = tuple[ok, ignore: bool, val: T]
-
-const
-  integers = {tkNumInt, tkNumHex, tkNumBin, tkNumOct}
-  numbers = integers + {tkNumFloat}
-  strings = {tkString, tkRawString}
-
-macro parsing(x: typedesc, body: untyped): untyped =
-  ## Converts a procedure definition like:
-  ## ```nim
-  ## proc foo() {.parsing[T].} =
-  ##   echo "hi"
-  ## ```
-  ## Into
-  ## ```nim
-  ## proc foo(parser: var Parser, required: bool = true): Match[T] {.discardable.} =
-  ##   let before = getPos(parser)
-  ##   echo "hi"
-  ## ```
-
-  body.expectKind(nnkProcDef)
-
-  result = body.copyNimTree()
-
-  result.params[0] = nnkBracketExpr.newTree(ident"Match", x) # Return type
-  result.params.insert(
-    1, newIdentDefs(ident"parser", newNimNode(nnkVarTy).add(ident"Parser"))
-  )
-  result.params.add(newIdentDefs(ident"required", ident"bool", newLit(true)))
-
-  result.addPragma(ident"discardable")
-
-  if result[^1].kind == nnkStmtList:
-    result[^1].insert(
-      0,
-      quote do:
-        let before {.inject.} = parser.current,
-    )
-
-proc eof(parser: Parser, extra = 0): bool =
-  parser.current + extra >= parser.stack.len
-
-proc peek(parser: Parser, next = 0): Token =
-  if not parser.eof(next):
-    result = parser.stack[parser.current + next]
-  else:
-    let token = parser.stack[parser.current - 1]
-    result = Token(start: token.start + token.lexeme.len)
-
-proc error(parser: Parser, msg: string) =
-  let coord =
-    if parser.isStream:
-      parser.stream.getCoord(parser.peek().start)
-    else:
-      parser.source.getCoord(parser.peek().start)
-
-  let errorMsg =
-    if parser.isStream:
-      parser.stream.errorAt(coord)
-    else:
-      parser.source.errorAt(coord)
-
-  raise newException(
-    KdlParserError, &"{msg} at {coord.line + 1}:{coord.col + 1}\n{errorMsg.indent(2)}\n"
-  )
-
-proc consume(parser: var Parser, amount = 1) =
-  parser.current += amount
-
-template invalid[T](x: Match[T]) =
-  ## Returns if x is ok
-  let val = x
-
-  result.ok = val.ok
-
-  if val.ok:
-    return
-
-template valid[T](x: Match[T]): T =
-  ## Returns if x is not ok and gives x.val back
-  let val = x
-
-  result.ok = val.ok
-
-  if not val.ok:
-    result.ignore = false
-    parser.current = before
-    return
-
-  val.val
-
-template hasValue[T](match: Match[T]): bool =
-  let (ok, ignore, val {.inject.}) = match
-  ok and not ignore
-
-template setValue[T](x: untyped, match: Match[T]) =
-  if hasValue match:
-    x = val
-
-proc match(x: TokenKind | set[TokenKind]) {.parsing: Token.} =
-  let token = parser.peek()
-  let matches =
-    when x is TokenKind:
-      token.kind == x
-    else:
-      token.kind in x
-
-  if matches:
-    result.ok = true
-    result.val = token
-    parser.consume()
-  elif required:
-    when x is TokenKind:
-      parser.error &"Expected {x} but found {token.kind}"
-    else:
-      parser.error &"Expected one of {x} but found {token.kind}"
-
-proc skipWhile(parser: var Parser, kinds: set[TokenKind]): int {.discardable.} =
-  while not parser.eof():
-    if parser.peek().kind in kinds:
-      parser.consume()
-      inc result
+proc parseDecimalDigits(p: Parser, allowSign: bool = true): ParseResult[string] =
+  var numStr = ""
+  if allowSign and not p.atEnd() and p.source[p.pos] in {'+', '-'}:
+    numStr.add(p.source[p.pos])
+    p.advance()
+  let digitStart = p.pos
+  while not p.atEnd():
+    let c = p.source[p.pos]
+    if c in Digits:
+      numStr.add(c)
+      p.advance()
+    elif c == '_':
+      p.advance()
     else:
       break
-
-proc more(kind: TokenKind) {.parsing: None.} =
-  ## Matches one or more tokens of `kind`
-  discard valid parser.match(kind, required)
-  discard parser.skipWhile({kind})
-
-proc parseNumber(token: Token, tag: Option[string]): KdlVal =
-  assert token.kind in numbers
-
-  if token.kind in integers:
-    # Handle hex numbers specially - they default to unsigned
-    if token.kind == tkNumHex:
-      let hexDigits = token.lexeme[2..^1]  # Skip "0x" prefix
-
-      # Check if value is too large for uint64 (more than 16 hex digits)
-      if hexDigits.len > 16:
-        # Use BigInt for large hex values
-        let bigVal = initBigInt(hexDigits, 16)
-        result = KdlVal(kind: KBigInt, bigint: bigVal, tag: tag)
-      else:
-        var hexVal: BiggestUInt
-        discard parseHex(token.lexeme, hexVal, 2)  # Start after "0x"
-
-        case tag.get(string.default)
-        of "i8":
-          result = initKVal(cast[int64](hexVal).int8, tag)
-        of "i16":
-          result = initKVal(cast[int64](hexVal).int16, tag)
-        of "i32":
-          result = initKVal(cast[int64](hexVal).int32, tag)
-        of "i64":
-          result = initKVal(cast[int64](hexVal), tag)
-        of "isize":
-          result = initKVal(cast[int64](hexVal).int, tag)
-        of "u8":
-          result = initKVal(hexVal.uint8, tag)
-        of "u16":
-          result = initKVal(hexVal.uint16, tag)
-        of "u32":
-          result = initKVal(hexVal.uint32, tag)
-        of "u64":
-          result = initKVal(hexVal.uint64, tag)
-        of "usize":
-          result = initKVal(hexVal.uint, tag)
-        else:
-          # Default: store hex as unsigned
-          result = initKVal(hexVal.uint64, tag)
-    else:
-      # Non-hex integers: decimal, binary, octal
-      # Try to parse as regular int, fall back to BigInt if too large
-      try:
-        let numVal = case token.kind
-                     of tkNumInt:
-                       token.lexeme.parseBiggestInt()
-                     of tkNumBin:
-                       token.lexeme.parseBinInt()
-                     of tkNumOct:
-                       token.lexeme.parseOctInt()
-                     else:
-                       0
-
-        case tag.get(string.default)
-        of "i8":
-          result = initKVal(numVal.int8, tag)
-        of "i16":
-          result = initKVal(numVal.int16, tag)
-        of "i32":
-          result = initKVal(numVal.int32, tag)
-        of "i64":
-          result = initKVal(numVal.int64, tag)
-        of "isize":
-          result = initKVal(numVal.int, tag)
-        of "u8":
-          result = initKVal(numVal.uint8, tag)
-        of "u16":
-          result = initKVal(numVal.uint16, tag)
-        of "u32":
-          result = initKVal(numVal.uint32, tag)
-        of "u64":
-          result = initKVal(numVal.uint64, tag)
-        of "usize":
-          result = initKVal(numVal.uint, tag)
-        else:
-          # For unsupported types like i128, u128, store as int64 with tag preserved
-          # Applications can handle these specially based on the tag
-          result = initKVal(numVal, tag)
-      except ValueError:
-        # Number too large for int64, use BigInt
-        let base = case token.kind
-                   of tkNumInt: 10
-                   of tkNumBin: 2
-                   of tkNumOct: 8
-                   else: 10
-        let digits = if token.kind == tkNumBin: token.lexeme[2..^1]
-                     elif token.kind == tkNumOct: token.lexeme[2..^1]
-                     else: token.lexeme
-        let bigVal = initBigInt(digits, base)
-        result = KdlVal(kind: KBigInt, bigint: bigVal, tag: tag)
-  else:
-    # Handle special float keywords: #inf, #-inf, #nan
-    let fnumVal = case token.lexeme
-      of "#inf": Inf
-      of "#-inf": -Inf
-      of "#nan": NaN
-      else: token.lexeme.parseFloat()
-
-    case tag.get(string.default)
-    of "f32":
-      result = initKVal(fnumVal.float32, tag)
-    of "f64":
-      result = initKVal(fnumVal.float64, tag)
-    else:
-      # For unsupported types like decimal64, decimal128, store as float64 with tag preserved
-      # Applications can handle these specially based on the tag
-      result = initKVal(fnumVal, tag)
-
-proc continuesWithNewLine(s: string, at: var int, consume = true): bool =
-  ## Checks if there's a new line in s at at and increments at by the lenght
-  ## of the new line if consume is true
-  for nl in newLines:
-    if s.continuesWith(nl, at):
-      if consume:
-        at.inc nl.len
-      return true
-
-proc continuesWithWhitespace(s: string, at: var int, consume = true): bool =
-  ## Checks if there's a whitespace in s at at and increments at by the lenght
-  ## of the whitespace if consume is true
-  for w in whitespaces:
-    if s.continuesWith($Rune(w), at):
-      if consume:
-        at.inc w.Rune.size
-      return true
-
-proc resolveWhitespaceEscapes(str: string): string =
-  ## Phase 1: Resolve ONLY whitespace escapes (\ followed by whitespace/newline)
-  ## According to KDL 2.0 spec, this MUST be done BEFORE dedentation
-  var i = 0
-  while i < str.len:
-    if str[i] == '\\' and i + 1 < str.len:
-      let nextChar = str[i + 1]
-      # Special case: \\ is an escaped backslash, keep both characters
-      if nextChar == '\\':
-        result.add str[i]
-        result.add str[i + 1]
-        i += 2
-      # Check if this is escaped whitespace/newline
-      elif nextChar in {' ', '\t', '\r', '\n'}:
-        # Consume the backslash
-        inc i
-        # Consume all following whitespace/newlines
-        while i < str.len and str[i] in {' ', '\t', '\r', '\n'}:
-          inc i
-        # Don't add anything - the escaped whitespace is consumed
-      else:
-        # Not whitespace escape, keep the backslash for later processing
-        result.add str[i]
-        inc i
-    else:
-      result.add str[i]
-      inc i
-
-proc escapeString(str: string, x = 0 .. str.high): string =
-  ## Phase 2: Process non-whitespace escape sequences
-  ## (whitespace escapes should already be resolved via resolveWhitespaceEscapes)
-  var i = x.a
-  while i <= x.b:
-    if str[i] == '\\':
-      inc i # Consume backslash
-
-      if i > x.b: # Dangling backslash
-        result.add '\\'
-        break
-
-      case str[i]
-      of '\\': result.add '\\'
-      of 'n': result.add '\n'
-      of 'r': result.add '\r'
-      of 't': result.add '\t'
-      of 'b': result.add '\b'
-      of 'f': result.add '\f'
-      of 's': result.add ' '  # KDL 2.0: \s is space
-      of '"': result.add '"'
-      of 'u':
-        inc i
-        if i > x.b or str[i] != '{':
-          # Invalid unicode escape, treat as literal 'u'
-          result.add "u"
-          dec i # Backtrack to not consume the character after 'u'
-        else:
-          inc i
-          var hex: string
-          let start = i
-          while i <= x.b and str[i] in HexDigits:
-            inc i
-          hex = str[start ..< i]
-
-          if i <= x.b and str[i] == '}':
-            # Validate hex digit count (1-6 digits per KDL spec)
-            if hex.len < 1 or hex.len > 6:
-              raise newException(KdlParserError, "Unicode escape \\u{" & hex & "} must have 1-6 hexadecimal digits, found " & $hex.len)
-
-            let codepoint = parseHexInt(hex)
-            # Validate Unicode codepoint
-            if codepoint >= 0xD800 and codepoint <= 0xDFFF:
-              raise newException(KdlParserError, "Unicode escape \\u{" & hex & "} is a surrogate codepoint (U+D800 to U+DFFF), which is invalid")
-            elif codepoint > 0x10FFFF:
-              raise newException(KdlParserError, "Unicode escape \\u{" & hex & "} exceeds maximum Unicode codepoint (U+10FFFF)")
-            result.add Rune(codepoint)
-          else:
-            # Invalid unicode escape, treat as literal
-            result.add "\\u{" & hex
-            if i <= x.b:
-              result.add str[i]
-      else:
-        # Check for escaped whitespace (\ followed by whitespace/newline)
-        # This handles regular strings; multiline strings pre-process with resolveWhitespaceEscapes
-        if str[i] in {' ', '\t', '\r', '\n'}:
-          # Consume all following whitespace and newlines
-          while i <= x.b and str[i] in {' ', '\t', '\r', '\n'}:
-            inc i
-          dec i  # Back up one since we'll inc at the end of the loop
-        else:
-          # Any other escaped character is treated as the character itself
-          result.add str[i]
-      inc i
-    else:
-      result.add str[i]
-      inc i
-
-proc parseString(token: Token, multilineStringsNewLines: seq[(int, int)]): KdlVal =
-  assert token.kind in strings
-
-  result = initKString()
-
-  var varToken = token
-  varToken.lexeme = newStringOfCap(token.lexeme.len)
-
-  var i = 0
-  while i < token.lexeme.len:
-    let before = i
-    for (idx, length) in multilineStringsNewLines:
-      if i + token.start == idx:
-        varToken.lexeme.add '\n'
-        i += length
-
-    if i == before:
-      varToken.lexeme.add token.lexeme[i]
-      inc i
-
-  if token.kind == tkString:
-    # Check if it's a multiline string (starts with """)
-    if varToken.lexeme.len >= 6 and varToken.lexeme[0..2] == "\"\"\"":
-      # Multiline string: skip first 3 and last 3 quotes
-      var content = varToken.lexeme[3 ..< varToken.lexeme.len - 3]
-
-      # Strip first newline if present
-      if content.len > 0 and content[0] == '\n':
-        content = content[1..^1]
-
-      # Validate: line continuation cannot escape past content boundary
-      # The '\' escapes whitespace/newlines. Invalid cases:
-      # 1. "bar\" (nothing after \) - would escape the delimiter itself
-      # 2. "bar\\n  " (\ escapes newline + indent of closing line) - ambiguous dedent
-      # Valid: "bar\   " (\ escapes trailing spaces within content) - OK
-      var i = content.len - 1
-
-      # Case 1: Content ends with '\' as last character (truly nothing after)
-      if i >= 0 and content[i] == '\\':
-        raise newException(KdlParserError, "Line continuation (\\) cannot be the last character before closing delimiter")
-
-      # Case 2: '\' followed by newline then whitespace (escapes closing line indent)
-      # Skip trailing spaces/tabs to find newline
-      while i >= 0 and content[i] in {' ', '\t'}:
-        dec i
-      # If we have trailing whitespace and it's preceded by newline and that line ends with '\'
-      if i >= 0 and content[i] == '\n':
-        let hadTrailingWhitespace = content[content.len - 1] in {' ', '\t'}
-        if hadTrailingWhitespace:
-          # Check if line before this newline ends with '\'
-          dec i
-          if i >= 0 and content[i] == '\r':  # Handle \r\n
-            dec i
-          if i >= 0 and content[i] == '\\':
-            # The '\' would escape the newline and closing line's whitespace
-            raise newException(KdlParserError, "Line continuation (\\) cannot escape the closing line's indentation")
-
-      # STEP 1: Resolve whitespace escapes BEFORE dedentation (KDL 2.0 spec requirement)
-      content = resolveWhitespaceEscapes(content)
-
-      # STEP 2: Find indentation of closing line
-      var lastNewlinePos = -1
-      for i in countdown(content.len - 1, 0):
-        if content[i] == '\n':
-          lastNewlinePos = i
-          break
-
-      # Calculate base indentation from closing line
-      var baseIndent = ""
-      if lastNewlinePos >= 0:
-        # Extract whitespace after last newline (the closing line's indent)
-        for i in (lastNewlinePos + 1) ..< content.len:
-          if content[i] in {' ', '\t'}:
-            baseIndent.add content[i]
-          else:
-            break
-
-        # Remove the closing line (it's just indentation)
-        content = content[0..lastNewlinePos]
-        # Remove trailing newline
-        if content.len > 0 and content[^1] == '\n':
-          content = content[0..^2]
-      else:
-        # No newline means the entire content is the closing line indentation
-        baseIndent = content
-        content = ""
-
-      # STEP 3: Apply dedentation
-      if baseIndent.len > 0 and content.len > 0:
-        var dedented = ""
-        var i = 0
-        while i < content.len:
-          if content[i] == '\n' or i == 0:
-            # Start of a line
-            if i > 0:
-              dedented.add '\n'
-              inc i
-
-            # Try to match and remove base indentation
-            var matched = 0
-            while matched < baseIndent.len and i + matched < content.len and
-                  content[i + matched] == baseIndent[matched]:
-              inc matched
-
-            # Validate: if we couldn't match all base indentation, check if line is not empty
-            if matched < baseIndent.len and i + matched < content.len and content[i + matched] != '\n':
-              # Line has content but doesn't have the full base indentation - error
-              raise newException(KdlParserError,
-                "Multiline string indentation error: content line does not start with the closing line's indentation")
-
-            # Skip the matched indentation
-            i += matched
-          else:
-            dedented.add content[i]
-            inc i
-
-        content = dedented
-
-      # STEP 4: Resolve other escape sequences (after dedentation)
-      result.str = escapeString(content)
-    else:
-      # Regular string: skip first and last quote
-      result.str = escapeString(varToken.lexeme, 1 ..< varToken.lexeme.high)
-  else: # Raw string
-    var hashes: string
-    discard
-      varToken.lexeme.parseUntil(hashes, '"', start = 0) # Count the number of hashes
-
-    # Check if it's a multiline raw string (has """ after hashes)
-    let quoteStart = hashes.len
-    if varToken.lexeme.len >= quoteStart + 6 and
-       varToken.lexeme[quoteStart..quoteStart+2] == "\"\"\"":
-      # Multiline raw string: exclude hashes + """ and """ + hashes, apply dedentation
-      var content = varToken.lexeme[quoteStart + 3 .. varToken.lexeme.high - hashes.len - 3]
-
-      # Strip first newline if present
-      if content.len > 0 and content[0] == '\n':
-        content = content[1..^1]
-
-      # Find indentation of closing line
-      var lastNewlinePos = -1
-      for i in countdown(content.len - 1, 0):
-        if content[i] == '\n':
-          lastNewlinePos = i
-          break
-
-      # Calculate base indentation from closing line
-      var baseIndent = ""
-      if lastNewlinePos >= 0:
-        for i in (lastNewlinePos + 1) ..< content.len:
-          if content[i] in {' ', '\t'}:
-            baseIndent.add content[i]
-          else:
-            break
-
-        # Remove the closing line
-        content = content[0..lastNewlinePos]
-        if content.len > 0 and content[^1] == '\n':
-          content = content[0..^2]
-      else:
-        # No newline means the entire content is the closing line indentation
-        baseIndent = content
-        content = ""
-
-      # Apply dedentation (raw strings don't process escapes, so no escapeString call)
-      if baseIndent.len > 0:
-        var dedented = ""
-        var i = 0
-        while i < content.len:
-          if content[i] == '\n' or i == 0:
-            if i > 0:
-              dedented.add '\n'
-              inc i
-
-            # Try to match and remove base indentation
-            var matched = 0
-            while matched < baseIndent.len and i + matched < content.len and
-                  content[i + matched] == baseIndent[matched]:
-              inc matched
-
-            # Validate: if we couldn't match all base indentation, check if line is not empty
-            if matched < baseIndent.len and i + matched < content.len and content[i + matched] != '\n':
-              # Line has content but doesn't have the full base indentation - error
-              raise newException(KdlParserError,
-                "Multiline string indentation error: content line does not start with the closing line's indentation")
-
-            i += matched
-          else:
-            dedented.add content[i]
-            inc i
-
-        result.str = dedented
-      else:
-        result.str = content
-    else:
-      # Regular raw string
-      result.str =
-        varToken.lexeme[1 + hashes.len .. varToken.lexeme.high - hashes.len - 1]
-
-proc parseValue(token: Token, multilineStringsNewLines: seq[(int, int)], tag: Option[string]): KdlVal =
-  case token.kind
-  of numbers:
-    token.parseNumber(tag)
-  of strings:
-    let strVal = token.parseString(multilineStringsNewLines).getString()
-    case tag.get(string.default)
-    of "date":
-      initKVal(strVal, KDate, tag)
-    of "time":
-      initKVal(strVal, KTime, tag)
-    of "date-time", "datetime": # KDL 2.0 uses date-time, but allow datetime for flexibility
-      initKVal(strVal, KDateTime, tag)
-    of "duration":
-      initKVal(strVal, KDuration, tag)
-    else:
-      initKVal(strVal, tag)
-  of tkIdent:
-    # Bare identifiers are treated as string values in KDL 2.0
-    initKVal(token.lexeme, tag)
-  of tkBool:
-    # KDL 2.0: booleans are #true and #false
-    initKVal(token.lexeme == "#true", tag)
-  of tkNull:
-    # KDL 2.0: null is #null
-    initKVal(nil, tag)
-  else:
-    initKVal(nil, tag)
-    
-
-    
-proc parseIdent(
-    token: Token, multilineStringsNewLines: seq[(int, int)]
-): Option[string] =
-  case token.kind
-  of strings:
-    token.parseString(multilineStringsNewLines).getString().some
-  of tkIdent:
-    token.lexeme.some
-  else:
-    string.none
-
-proc skipLineSpaces(parser: var Parser) =
-  parser.skipWhile({tkNewLine, tkWhitespace, tkLineCont})
-
-proc matchLineCont() {.parsing: None.} =
-  parser.skipWhile({tkWhitespace})
-  discard valid parser.match(tkLineCont, required)
-  discard parser.skipWhile({tkWhitespace})
-
-proc matchNodeSpace() {.parsing: None.} =
-  invalid parser.matchLineCont(required = false)
-  discard valid parser.more(tkWhitespace, required)
-
-proc matchSlashDash() {.parsing: None.} =
-  discard valid parser.match(tkSlashDash, required)
-  while parser.matchNodeSpace(required = false).ok:
-    discard
-
-proc matchIdent() {.parsing: Option[string].} =
-  result.val = valid(parser.match({tkIdent} + strings, required)).parseIdent(
-      parser.multilineStringsNewLines
-    )
-
-proc matchTag() {.parsing: Option[string].} =
-  discard valid parser.match(tkOpenPar, required)
-  parser.skipWhile({tkWhitespace})  # Skip whitespace/comments after (
-  result.val = valid parser.matchIdent(required = true)
-  parser.skipWhile({tkWhitespace})  # Skip whitespace/comments before )
-  discard parser.match(tkClosePar, true)
-
-proc matchValue(slashdash = false) {.parsing: KdlVal.} =
-  if slashdash:
-    result.ignore = parser.matchSlashDash(required = false).ok
-
-  let (_, _, tag) = parser.matchTag(required = false)
-  parser.skipWhile({tkWhitespace})  # Skip whitespace/comments after type annotation
-
-  # In KDL 2.0, bare identifiers (tkIdent) are valid as string values
-  result.val = valid(parser.match({tkBool, tkNull, tkIdent} + strings + numbers, required))
-    .parseValue(parser.multilineStringsNewLines, tag)
-  result.val.tag = tag
-
-proc matchProp(slashdash = true) {.parsing: KdlProp.} =
-  if slashdash:
-    result.ignore = parser.matchSlashDash(required = false).ok
-
-  let ident = valid parser.matchIdent(required = false)
-
-  # KDL 2.0 allows whitespace before and after '=' in properties
-  parser.skipWhile({tkWhitespace})
-  discard valid parser.match(tkEqual, required)
-  parser.skipWhile({tkWhitespace})
-
-  let value = valid parser.matchValue(required = true)
-
-  result.val = (ident.get, value)
-
-proc matchNodeEnd() {.parsing: None.} =
-  result.ok = parser.eof()
-
-  if not result.ok:
-    let token = parser.peek()
-    discard valid parser.match({tkNewLine, tkSemicolon, tkCloseBra}, required)
-
-    if token.kind == tkCloseBra: # Unconsume
-      dec parser.current
-
-proc matchNode(slashdash = true) {.parsing: KdlNode.}
-
-proc matchNodes() {.parsing: KdlDoc.} =
-  parser.skipLineSpaces()
-
-  while not parser.eof():
-    if hasValue parser.matchNode(required = required):
-      result.ok = true
-      result.val.add val
-    elif not required:
+  if p.pos == digitStart:
+    return ParseResult[string](ok: false)
+  return ParseResult[string](ok: true, value: numStr, endPos: p.pos)
+
+proc slashdash(p: Parser): ParseResult[string] =
+  let start = p.pos
+  if p.tryStr("/-").ok:
+    return ParseResult[string](ok: true, value: "/-", endPos: p.pos)
+  return ParseResult[string](ok: false)
+
+# Character-level parsers
+
+const NEWLINES = [
+  "\r\n",      # CRLF
+  "\r",        # CR
+  "\n",        # LF
+  "\u{0085}",  # NEL
+  "\u{000B}",  # VT
+  "\u{000C}",  # FF
+  "\u{2028}",  # LS
+  "\u{2029}",  # PS
+]
+
+proc newline(p: Parser): ParseResult[string] =
+  ## Parses a newline sequence
+  for nl in NEWLINES:
+    let maybeStr = p.peekStr(nl.len)
+    if maybeStr.isSome and maybeStr.get == nl:
+      p.advance(nl.len)
+      return success(nl, p.pos)
+  return failure[string]()
+
+proc unicodeSpace(p: Parser): ParseResult[string] =
+  ## Parses a single Unicode whitespace character
+  if p.atEnd():
+    return failure[string]()
+
+  var pos = p.pos
+  let r = p.source.runeAt(pos)
+
+  if isUnicodeSpace(r):
+    let start = p.pos
+    p.pos += r.size
+    return success(p.source[start ..< p.pos], p.pos)
+
+  return failure[string]()
+
+proc singleLineComment(p: Parser): ParseResult[string] =
+  ## Parses a single-line comment starting with //
+  let start = p.pos
+  if not p.tryStr("//").ok:
+    return failure[string]()
+
+  # Take everything until newline
+  var comment = "//"
+  while not p.atEnd():
+    let c = p.source[p.pos]
+    if c == '\n' or c == '\r':
       break
+    comment.add(c)
+    p.advance()
 
-    parser.skipLineSpaces()
+  return success(comment, p.pos)
 
-proc matchChildren(slashdash = true) {.parsing: KdlDoc.} =
-  if slashdash:
-    result.ignore = parser.matchSlashDash(required = false).ok
-    # After slashdash, skip line spaces before the children block
-    if result.ignore:
-      parser.skipLineSpaces()
+proc multiLineComment(p: Parser): ParseResult[string] =
+  ## Parses a multi-line comment /* ... */ with nesting support
+  let start = p.pos
+  if not p.tryStr("/*").ok:
+    return failure[string]()
 
-  discard valid parser.match(tkOpenBra, required)
-  result.val = parser.matchNodes(required = false).val
-  discard valid parser.match(tkCloseBra, true)
+  var comment = "/*"
+  var depth = 1
 
-proc matchNode(slashdash = true) {.parsing: KdlNode.} =
-  if slashdash:
-    result.ignore = parser.matchSlashDash(required = false).ok
-    # After slashdash at document level, skip line spaces before the commented node
-    if result.ignore:
-      parser.skipLineSpaces()
-
-  let tag = parser.matchTag(required = false).val
-  parser.skipWhile({tkWhitespace})  # Skip whitespace/comments after node type annotation
-  let ident = valid parser.matchIdent(required)
-
-  result.val = initKNode(ident.get, tag = tag)
-
-  invalid parser.matchNodeEnd(required = false)
-
-  # Check if children block immediately follows (e.g., node{})
-  if parser.peek().kind == tkOpenBra:
-    setValue result.val.children, parser.matchChildren(required = false)
-    invalid parser.matchNodeEnd(required = true)
-    return
-
-  # Node has arguments/properties - parse them
-  # Check for spacing at the START of each iteration to prevent infinite loops
-  while true: # Match arguments and properties
-    # Check for spacing BEFORE attempting to parse entry
-    let hasSpace = parser.matchNodeSpace(required = false).ok
-
-    if not hasSpace:
-      # No space found - check for special cases
-      let nextToken = parser.peek().kind
-      if nextToken == tkOpenBra:
-        # Children block immediately follows
-        dec parser.current # Unconsume to match it later
-        break
-      elif nextToken != tkSlashDash:
-        # No space and not slashdash - node must end here
-        break
-      # else: nextToken == tkSlashDash, zero-space slashdash is valid, continue parsing
-
-    # Check for slashdash before entry
-    # But first peek ahead to see if it's for the children block
-    let isSlashdashed =
-      if parser.peek().kind == tkSlashDash:
-        # Look ahead past slashdash and any whitespace
-        let savedPos = parser.current
-        discard parser.matchSlashDash(required = false)
-        parser.skipLineSpaces()
-        let nextIsChildren = parser.peek().kind == tkOpenBra
-        parser.current = savedPos  # Reset position
-
-        if nextIsChildren:
-          # Slashdash is for children block, not for an entry
-          false
-        else:
-          # Slashdash is for this entry, consume it
-          discard parser.matchSlashDash(required = false)
-          parser.skipLineSpaces()
-          true
-      else:
-        false
-
-    # Try to parse property (key=value) or argument (value)
-    let propMatch = parser.matchProp(required = false, slashdash = false)
-
-    if hasValue propMatch:
-      if not isSlashdashed:
-        result.val.props[val.key] = val.val
+  while not p.atEnd() and depth > 0:
+    # Check for nested comment start
+    if p.peekStr(2).isSome and p.peekStr(2).get == "/*":
+      comment.add("/*")
+      p.advance(2)
+      depth += 1
+    # Check for comment end
+    elif p.peekStr(2).isSome and p.peekStr(2).get == "*/":
+      comment.add("*/")
+      p.advance(2)
+      depth -= 1
     else:
-      # Not a property, try to parse as argument value
-      let valMatch = parser.matchValue(required = false, slashdash = false)
-      if hasValue valMatch:
-        if not isSlashdashed:
-          result.val.args.add val
-      else:
-        # Neither property nor value matched
-        if isSlashdashed:
-          # Slashdash without a following entry is an error
-          parser.error("Slashdash (/-) must be followed by a node entry")
-        # Stop parsing entries
-        break
+      comment.add(p.source[p.pos])
+      p.advance()
 
-  # Match all children blocks (slashdashed or not)
-  # KDL 2.0 allows multiple children blocks like: node {} /-{} {} /-{}
+  if depth > 0:
+    p.addError("Unclosed multi-line comment", "expected */")
+    return failure[string]()
+
+  return success(comment, p.pos)
+
+proc ws(p: Parser): ParseResult[string] =
+  ## Parses whitespace (unicode space or multi-line comment)
+  let usRes = unicodeSpace(p)
+  if usRes.ok:
+    return usRes
+
+  let mlcRes = multiLineComment(p)
+  if mlcRes.ok:
+    return mlcRes
+
+  return failure[string]()
+
+proc wss(p: Parser): string =
+  ## Parses zero or more whitespace
+  result = ""
   while true:
-    # Skip whitespace and line continuations between children blocks
-    parser.skipWhile({tkWhitespace})
-    while parser.peek().kind == tkLineCont:
-      discard parser.match(tkLineCont, false)
-      parser.skipLineSpaces()
-      parser.skipWhile({tkWhitespace})
-
-    # Check for children block (slashdashed or not)
-    let nextKind = parser.peek().kind
-    if nextKind == tkSlashDash or nextKind == tkOpenBra:
-      # For slashdashed children BETWEEN blocks (not first), validate immediately followed by {
-      # At this point, we've already consumed whitespace on line 768
-      # If we see slashdash now and we already have children, this is between blocks
-      if nextKind == tkSlashDash and result.val.children.len > 0:
-        let savedPos = parser.current
-        discard parser.match(tkSlashDash, false)
-        # At this context (between blocks), only newline/escline are allowed before {
-        # Whitespace tokens mean same-line space which is invalid
-        let afterSlashdash = parser.peek().kind
-        if afterSlashdash == tkWhitespace:
-          parser.current = savedPos
-          parser.error("Slashdash between children blocks must not have space before '{': use '/-{' or '/-\\n{'")
-        parser.current = savedPos
-
-      let childrenMatch = parser.matchChildren(required = false)
-      if hasValue childrenMatch:
-        # Only use the first non-slashdashed children block
-        if result.val.children.len == 0:
-          result.val.children = val
+    let res = ws(p)
+    if res.ok:
+      result.add(res.value)
     else:
       break
 
-  invalid parser.matchNodeEnd(required = true)
+proc wsp(p: Parser): ParseResult[string] =
+  ## Parses one or more whitespace
+  let first = ws(p)
+  if not first.ok:
+    return failure[string]()
 
-proc parseKdl*(lexer: sink Lexer): KdlDoc =
-  if lexer.isStream:
-    var parser = Parser(
-      isStream: true,
-      multilineStringsNewLines: lexer.multilineStringsNewLines,
-      stack: lexer.stack,
-      stream: lexer.stream,
-    )
-    defer:
-      parser.stream.close()
-    result = parser.matchNodes().val
+  var spaces = first.value
+  spaces.add(wss(p))
+  return success(spaces, p.pos)
+
+proc lineSpace(p: Parser): ParseResult[string] =
+  ## Parses line-space: newline | ws | single-line-comment
+  let nlRes = newline(p)
+  if nlRes.ok:
+    return nlRes
+
+  let wsRes = ws(p)
+  if wsRes.ok:
+    return wsRes
+
+  let slcRes = singleLineComment(p)
+  if slcRes.ok:
+    return slcRes
+
+  return failure[string]()
+
+proc escline(p: Parser): ParseResult[string] =
+  ## Parses an escaped line continuation: \ + (whitespace|comment) + newline + whitespace
+  let start = p.pos
+  if not p.tryChar('\\').ok:
+    return failure[string]()
+
+  var escape = "\\"
+  escape.add(wss(p))
+
+  # Also try to consume single-line comment before newline
+  let slcRes = singleLineComment(p)
+  if slcRes.ok:
+    escape.add(slcRes.value)
+
+  let nlRes = newline(p)
+  if not nlRes.ok:
+    p.pos = start
+    return failure[string]()
+
+  escape.add(nlRes.value)
+  escape.add(wss(p))
+
+  return success(escape, p.pos)
+
+proc nodeSpace(p: Parser): ParseResult[string] =
+  ## Parses node-space: (ws* escline ws*) | ws+
+  let start = p.pos
+
+  # Try: ws* escline ws*
+  let leading = wss(p)
+  let escRes = escline(p)
+  if escRes.ok:
+    let trailing = wss(p)
+    return success(leading & escRes.value & trailing, p.pos)
+
+  # Reset and try ws+
+  p.pos = start
+  return wsp(p)
+
+# String parsing
+
+proc escapedChar(p: Parser): ParseResult[string] =
+  ## Parses an escaped character sequence
+  if not p.tryChar('\\').ok:
+    return failure[string]()
+
+  if p.atEnd():
+    p.unexpectedEof("escape sequence")
+    return failure[string]()
+
+  let c = p.source[p.pos]
+  p.advance()
+
+  case c
+  of 'n': return success("\n", p.pos)
+  of 'r': return success("\r", p.pos)
+  of 't': return success("\t", p.pos)
+  of '\\': return success("\\", p.pos)
+  of '/': return success("/", p.pos)
+  of '"': return success("\"", p.pos)
+  of 'b': return success("\b", p.pos)
+  of 'f': return success("\f", p.pos)
+  of 's': return success(" ", p.pos)
+  of 'u':
+    # Unicode escape: \u{HEXDIGITS}
+    if not p.expect('{').ok:
+      p.addError("Expected '{' after \\u")
+      return failure[string]()
+
+    var hexDigits = ""
+    while not p.atEnd() and p.source[p.pos] != '}':
+      let c = p.source[p.pos]
+      if c in HexDigits:
+        hexDigits.add(c)
+        p.advance()
+      else:
+        break
+
+    if not p.expect('}').ok:
+      p.addError("Expected '}' after Unicode escape")
+      return failure[string]()
+
+    if hexDigits.len == 0 or hexDigits.len > 6:
+      p.addError("Invalid Unicode escape length")
+      return failure[string]()
+
+    try:
+      let codepoint = parseHexInt(hexDigits)
+      if codepoint > 0x10FFFF:
+        p.addError("Unicode code point too large")
+        return failure[string]()
+      let rune = Rune(codepoint)
+      if isDisallowedCodePoint(rune):
+        p.disallowedCodePointError(rune)
+        return failure[string]()
+      return success(rune.toUTF8, p.pos)
+    except:
+      p.addError("Invalid Unicode escape")
+      return failure[string]()
   else:
-    var parser = Parser(
-      isStream: false,
-      multilineStringsNewLines: lexer.multilineStringsNewLines,
-      stack: lexer.stack,
-      source: lexer.source,
-    )
-    result = parser.matchNodes().val
+    p.addError("Invalid escape sequence: \\" & $c)
+    return failure[string]()
 
-proc parseKdl*(source: string, start = 0): KdlDoc =
-  var lexer = Lexer(isStream: false, source: source, current: start)
-  lexer.scanKdl()
-  result = lexer.parseKdl()
+proc quotedString(p: Parser): ParseResult[KdlVal] =
+  ## Parses a quoted string: "..." or """..."""
+  let start = p.pos
+  if not p.tryChar('"').ok:
+    return failure[KdlVal]()
 
-proc parseKdlFile*(path: string): KdlDoc =
-  parseKdl(readFile(path))
+  # Check for multiline string (""")
+  let isMultiline = p.peekStr(2).isSome and p.peekStr(2).get == "\"\""
+  if isMultiline:
+    p.advance(2)  # consume the other two quotes
 
-proc parseKdl*(stream: sink Stream): KdlDoc =
-  var lexer = Lexer(isStream: true, stream: stream)
-  lexer.scanKdl()
-  result = lexer.parseKdl()
+    # Must have at least one newline after opening """
+    let nlRes = newline(p)
+    if not nlRes.ok:
+      p.addError("Multiline string must start with a newline")
+      return failure[KdlVal]()
 
-proc parseKdlStream*(source: sink string): KdlDoc =
-  parseKdl(newStringStream(source))
+    # Collect lines
+    var lines: seq[string] = @[]
+    var currentLine = ""
 
-proc parseKdlFileStream*(path: string): KdlDoc =
-  parseKdl(newFileStream(path))
+    while not p.atEnd():
+      let c = p.source[p.pos]
+
+      # Check for closing """
+      if c == '"':
+        if p.peekStr(3).isSome and p.peekStr(3).get == "\"\"\"":
+          p.advance(3)
+          # Add the current line (might be closing line with indent)
+          lines.add(currentLine)
+          # Dedent based on last line's indentation
+          var indent = ""
+          if lines.len > 0:
+            let lastLine = lines[lines.len - 1]
+            for ch in lastLine:
+              if ch in {' ', '\t'}:
+                indent.add(ch)
+              else:
+                break
+          # Remove indent from all lines and remove last line (closing delimiter line)
+          var dedented: seq[string] = @[]
+          for i in 0 ..< lines.len - 1:
+            let line = lines[i]
+            if line.startsWith(indent):
+              dedented.add(line[indent.len .. ^1])
+            else:
+              dedented.add(line)
+          return success(initKString(dedented.join("\n")), p.pos)
+        else:
+          currentLine.add(c)
+          p.advance()
+      elif c == '\\':
+        let escRes = escapedChar(p)
+        if escRes.ok:
+          currentLine.add(escRes.value)
+        else:
+          return failure[KdlVal]()
+      elif c == '\n' or c == '\r':
+        lines.add(currentLine)
+        currentLine = ""
+        let nlRes = newline(p)
+        if not nlRes.ok:
+          p.advance()
+      else:
+        currentLine.add(c)
+        p.advance()
+
+    p.unexpectedEof("multiline quoted string")
+    return failure[KdlVal]()
+
+  # Single-line string
+  var str = ""
+
+  while not p.atEnd():
+    let c = p.source[p.pos]
+
+    if c == '"':
+      p.advance()
+      return success(initKString(str), p.pos)
+    elif c == '\\':
+      let escRes = escapedChar(p)
+      if not escRes.ok:
+        return failure[KdlVal]()
+      str.add(escRes.value)
+    elif c == '\n' or c == '\r':
+      p.addError("Unescaped newline in string")
+      return failure[KdlVal]()
+    else:
+      # Check for disallowed code points
+      let r = p.source.runeAt(p.pos)
+      if isDisallowedCodePoint(r):
+        p.disallowedCodePointError(r)
+        return failure[KdlVal]()
+      str.add(c)
+      p.advance()
+
+  p.unexpectedEof("quoted string")
+  return failure[KdlVal]()
+
+proc rawString(p: Parser): ParseResult[KdlVal] =
+  ## Parses a raw string: #"..."# or #"""..."""# (with any number of #)
+  let start = p.pos
+
+  # Count leading hashes
+  var hashCount = 0
+  while not p.atEnd() and p.source[p.pos] == '#':
+    hashCount += 1
+    p.advance()
+
+  if hashCount == 0:
+    return failure[KdlVal]()
+
+  # Check for triple-quote (multiline raw string)
+  let isMultiline = p.peekStr(3).isSome and p.peekStr(3).get == "\"\"\""
+
+  if isMultiline:
+    # Multiline raw string
+    p.advance(3)  # Skip """
+
+    # Must have at least one newline after opening """
+    let nlRes = newline(p)
+    if not nlRes.ok:
+      p.addError("Multiline raw string must start with a newline")
+      return failure[KdlVal]()
+
+    var lines: seq[string] = @[]
+    var currentLine = ""
+    var foundClosing = false
+
+    while not p.atEnd():
+      # Check for closing """ followed by matching hashes
+      if p.peekStr(3).isSome and p.peekStr(3).get == "\"\"\"":
+        let afterQuotes = p.pos + 3
+        var closingHashes = 0
+        var checkPos = afterQuotes
+        while checkPos < p.source.len and p.source[checkPos] == '#' and closingHashes < hashCount:
+          closingHashes += 1
+          checkPos += 1
+
+        if closingHashes == hashCount:
+          # Found closing delimiter
+          p.pos = checkPos
+          lines.add(currentLine)
+          foundClosing = true
+          break
+
+      # Regular character
+      let c = p.source[p.pos]
+      if c == '\n' or c == '\r':
+        lines.add(currentLine)
+        currentLine = ""
+        let nlRes = newline(p)
+        if not nlRes.ok:
+          p.advance()
+      else:
+        currentLine.add(c)
+        p.advance()
+
+    if not foundClosing:
+      p.unexpectedEof("multiline raw string")
+      return failure[KdlVal]()
+
+    # Dedent based on last line's indentation
+    var indent = ""
+    if lines.len > 0:
+      let lastLine = lines[lines.len - 1]
+      for ch in lastLine:
+        if ch in {' ', '\t'}:
+          indent.add(ch)
+        else:
+          break
+
+    # Remove indent from all lines except the last line (closing delimiter line)
+    var dedented: seq[string] = @[]
+    for i in 0 ..< lines.len - 1:
+      let line = lines[i]
+      if line.startsWith(indent):
+        dedented.add(line[indent.len .. ^1])
+      else:
+        dedented.add(line)
+
+    return success(initKString(dedented.join("\n")), p.pos)
+
+  else:
+    # Single-line raw string
+    if not p.tryChar('"').ok:
+      return failure[KdlVal]()
+
+    var str = ""
+
+    while not p.atEnd():
+      let c = p.source[p.pos]
+
+      # Check for closing quote followed by matching hashes
+      if c == '"':
+        p.advance()
+        var closingHashes = 0
+        while not p.atEnd() and p.source[p.pos] == '#' and closingHashes < hashCount:
+          closingHashes += 1
+          p.advance()
+
+        if closingHashes == hashCount:
+          return success(initKString(str), p.pos)
+        else:
+          # Not enough hashes, continue
+          str.add('"')
+          str.add(repeat('#', closingHashes))
+      elif c == '\n' or c == '\r':
+        p.addError("Unescaped newline in single-line raw string")
+        return failure[KdlVal]()
+      else:
+        str.add(c)
+        p.advance()
+
+    p.unexpectedEof("raw string")
+    return failure[KdlVal]()
+
+proc identifierString(p: Parser): ParseResult[KdlVal] =
+  ## Parses an identifier as a bare string
+  let start = p.pos
+
+  if p.atEnd():
+    return failure[KdlVal]()
+
+  # Identifier must not start with digit or certain chars
+  let first = p.source[p.pos]
+  if not isIdentifierChar(first) or first in Digits:
+    return failure[KdlVal]()
+
+  var ident = ""
+  while not p.atEnd():
+    let c = p.source[p.pos]
+
+    # Check for comment starts: // or /*
+    if c == '/':
+      let next = p.peek()
+      if next.isSome and next.get in {'/', '*'}:
+        # Stop before comment
+        break
+
+    if isIdentifierChar(c):
+      ident.add(c)
+      p.advance()
+    else:
+      break
+
+  if ident.len == 0:
+    return failure[KdlVal]()
+
+  # Check if it's a reserved keyword that shouldn't be an identifier
+  if ident in ["true", "false", "null", "inf", "-inf", "nan"]:
+    p.pos = start
+    return failure[KdlVal]()
+
+  return success(initKString(ident), p.pos)
+
+proc string(p: Parser): ParseResult[tuple[value: KdlVal, repr: string]] =
+  ## Parses any form of string and returns the value + original representation
+  let start = p.pos
+
+  # Try raw string first (starts with #)
+  let rawRes = rawString(p)
+  if rawRes.ok:
+    let repr = p.source[start ..< p.pos]
+    return success((rawRes.value, repr), p.pos)
+
+  # Try quoted string
+  p.pos = start
+  let quotedRes = quotedString(p)
+  if quotedRes.ok:
+    let repr = p.source[start ..< p.pos]
+    return success((quotedRes.value, repr), p.pos)
+
+  # Try identifier string
+  p.pos = start
+  let identRes = identifierString(p)
+  if identRes.ok:
+    let repr = p.source[start ..< p.pos]
+    return success((identRes.value, repr), p.pos)
+
+  return failure[tuple[value: KdlVal, repr: string]]()
+
+# Identifier parsing
+
+proc identifier(p: Parser): ParseResult[KdlIdentifier] =
+  ## Parses a KDL identifier
+  let start = p.pos
+  let strRes = string(p)
+  if not strRes.ok:
+    return failure[KdlIdentifier]()
+
+  let (val, repr) = strRes.value
+  if val.kind != KString:
+    p.pos = start
+    return failure[KdlIdentifier]()
+
+  let span = p.getSpan(start)
+  return success(initKdlIdentifier(val.str, some(repr), some(span)), p.pos)
+
+# Number parsing
+
+proc keyword(p: Parser): ParseResult[KdlVal] =
+  ## Parses KDL keywords: #true, #false, #null, #inf, #-inf, #nan
+  let start = p.pos
+
+  if not p.tryChar('#').ok:
+    return failure[KdlVal]()
+
+  # Check if this might be a raw string (# followed by " or more #)
+  # If so, don't treat it as a keyword error
+  let c = p.peek()
+  if c.isSome and c.get in {'"', '#'}:
+    p.pos = start
+    return failure[KdlVal]()
+
+  if p.tryStr("true").ok:
+    return success(initKBool(true), p.pos)
+
+  p.pos = start + 1
+  if p.tryStr("false").ok:
+    return success(initKBool(false), p.pos)
+
+  p.pos = start + 1
+  if p.tryStr("null").ok:
+    return success(initKNull(), p.pos)
+
+  p.pos = start + 1
+  if p.tryStr("inf").ok:
+    return success(initKFloat(Inf), p.pos)
+
+  p.pos = start + 1
+  if p.tryStr("-inf").ok:
+    return success(initKFloat(NegInf), p.pos)
+
+  p.pos = start + 1
+  if p.tryStr("nan").ok:
+    return success(initKFloat(NaN), p.pos)
+
+  p.pos = start
+  p.addError("Invalid keyword after '#'")
+  return failure[KdlVal]()
+
+# parseDecimalDigits moved to top of file
+
+proc parseHexNumber(p: Parser): ParseResult[BigInt] =
+  ## Parses a hexadecimal number: 0x...
+  let start = p.pos
+
+  if not p.tryStr("0x").ok:
+    return failure[BigInt]()
+
+  var hexStr = ""
+  while not p.atEnd():
+    let c = p.source[p.pos]
+    if c in HexDigits:
+      hexStr.add(c)
+      p.advance()
+    elif c == '_':
+      p.advance()
+    else:
+      break
+
+  if hexStr.len == 0:
+    p.pos = start
+    p.addError("Invalid hexadecimal number")
+    return failure[BigInt]()
+
+  try:
+    # Parse hex string as BigInt to avoid overflow
+    var val = initBigInt(0)
+    let sixteen = initBigInt(16)
+    for c in hexStr:
+      val = val * sixteen
+      let digit = if c in '0'..'9': ord(c) - ord('0')
+                  elif c in 'a'..'f': ord(c) - ord('a') + 10
+                  elif c in 'A'..'F': ord(c) - ord('A') + 10
+                  else: 0
+      val = val + initBigInt(digit)
+    return success(val, p.pos)
+  except:
+    p.addError("Failed to parse hexadecimal number")
+    return failure[BigInt]()
+
+proc parseOctalNumber(p: Parser): ParseResult[BigInt] =
+  ## Parses an octal number: 0o...
+  let start = p.pos
+
+  if not p.tryStr("0o").ok:
+    return failure[BigInt]()
+
+  var octStr = ""
+  while not p.atEnd():
+    let c = p.source[p.pos]
+    if c in {'0'..'7'}:
+      octStr.add(c)
+      p.advance()
+    elif c == '_':
+      p.advance()
+    else:
+      break
+
+  if octStr.len == 0:
+    p.pos = start
+    p.addError("Invalid octal number")
+    return failure[BigInt]()
+
+  try:
+    # Parse octal string as BigInt to avoid overflow
+    var val = initBigInt(0)
+    let eight = initBigInt(8)
+    for c in octStr:
+      val = val * eight
+      let digit = ord(c) - ord('0')
+      val = val + initBigInt(digit)
+    return success(val, p.pos)
+  except:
+    p.addError("Failed to parse octal number")
+    return failure[BigInt]()
+
+proc parseBinaryNumber(p: Parser): ParseResult[BigInt] =
+  ## Parses a binary number: 0b...
+  let start = p.pos
+
+  if not p.tryStr("0b").ok:
+    return failure[BigInt]()
+
+  var binStr = ""
+  while not p.atEnd():
+    let c = p.source[p.pos]
+    if c in {'0', '1'}:
+      binStr.add(c)
+      p.advance()
+    elif c == '_':
+      p.advance()
+    else:
+      break
+
+  if binStr.len == 0:
+    p.pos = start
+    p.addError("Invalid binary number")
+    return failure[BigInt]()
+
+  try:
+    # Parse binary string as BigInt to avoid overflow
+    var val = initBigInt(0)
+    let two = initBigInt(2)
+    for c in binStr:
+      val = val * two
+      let digit = ord(c) - ord('0')
+      val = val + initBigInt(digit)
+    return success(val, p.pos)
+  except:
+    p.addError("Failed to parse binary number")
+    return failure[BigInt]()
+
+proc parseFloat(p: Parser): ParseResult[KdlVal] =
+  ## Parses a floating point number
+  let start = p.pos
+
+  # Parse the decimal part
+  let decRes = parseDecimalDigits(p, allowSign = true)
+  if not decRes.ok:
+    return failure[KdlVal]()
+
+  var floatStr = decRes.value
+
+  # Must have decimal point or exponent
+  var hasDecimalOrExp = false
+
+  # Optional decimal point + fractional part
+  if not p.atEnd() and p.source[p.pos] == '.':
+    hasDecimalOrExp = true
+    floatStr.add('.')
+    p.advance()
+
+    # Fractional digits
+    while not p.atEnd():
+      let c = p.source[p.pos]
+      if c in Digits:
+        floatStr.add(c)
+        p.advance()
+      elif c == '_':
+        p.advance()
+      else:
+        break
+
+  # Optional exponent
+  if not p.atEnd() and p.source[p.pos] in {'e', 'E'}:
+    hasDecimalOrExp = true
+    floatStr.add(p.source[p.pos])
+    p.advance()
+
+    # Optional sign in exponent
+    if not p.atEnd() and p.source[p.pos] in {'+', '-'}:
+      floatStr.add(p.source[p.pos])
+      p.advance()
+
+    # Exponent digits
+    var hasExpDigits = false
+    while not p.atEnd():
+      let c = p.source[p.pos]
+      if c in Digits:
+        floatStr.add(c)
+        hasExpDigits = true
+        p.advance()
+      elif c == '_':
+        p.advance()
+      else:
+        break
+
+    if not hasExpDigits:
+      p.addError("Expected digits after exponent")
+      return failure[KdlVal]()
+
+  if not hasDecimalOrExp:
+    p.pos = start
+    return failure[KdlVal]()
+
+  try:
+    let val = parseFloat(floatStr)
+    return success(initKFloat(val), p.pos)
+  except:
+    p.addError("Failed to parse float")
+    return failure[KdlVal]()
+
+proc parseInteger(p: Parser): ParseResult[KdlVal] =
+  ## Parses an integer (decimal, hex, octal, or binary)
+  let start = p.pos
+
+  # Try hex
+  let hexRes = parseHexNumber(p)
+  if hexRes.ok:
+    return success(initKBigInt(hexRes.value), p.pos)
+
+  # Try octal
+  p.pos = start
+  let octRes = parseOctalNumber(p)
+  if octRes.ok:
+    return success(initKBigInt(octRes.value), p.pos)
+
+  # Try binary
+  p.pos = start
+  let binRes = parseBinaryNumber(p)
+  if binRes.ok:
+    return success(initKBigInt(binRes.value), p.pos)
+
+  # Try decimal
+  p.pos = start
+  let decRes = parseDecimalDigits(p, allowSign = true)
+  if not decRes.ok:
+    return failure[KdlVal]()
+
+  try:
+    # Try to parse as i64 first
+    let val = parseBiggestInt(decRes.value)
+    return success(initKInt(val), p.pos)
+  except:
+    # Fall back to BigInt
+    try:
+      let val = decRes.value.initBigInt
+      return success(initKBigInt(val), p.pos)
+    except:
+      p.addError("Failed to parse integer")
+      return failure[KdlVal]()
+
+proc parseNumber(p: Parser): ParseResult[tuple[value: KdlVal, repr: string]] =
+  ## Parses any number (float or integer) and returns value + original repr
+  let start = p.pos
+
+  # Try float first (more specific)
+  let floatRes = parseFloat(p)
+  if floatRes.ok:
+    let repr = p.source[start ..< p.pos]
+    return success((floatRes.value, repr), p.pos)
+
+  # Try integer
+  p.pos = start
+  let intRes = parseInteger(p)
+  if intRes.ok:
+    let repr = p.source[start ..< p.pos]
+    return success((intRes.value, repr), p.pos)
+
+  return failure[tuple[value: KdlVal, repr: string]]()
+
+# Value and Type Annotation parsing
+
+proc valueTerminator(p: Parser): bool =
+  ## Checks if we're at a value terminator
+  if p.atEnd():
+    return true
+
+  let c = p.source[p.pos]
+  if c in {'=', ')', '{', '}', ';'}:
+    return true
+
+  # Check for slashdash or comments (/, //, /*)
+  if c == '/':
+    let next = p.peek(1)
+    if next.isSome and next.get in {'-', '/', '*'}:
+      return true
+
+  # Check for whitespace/newline
+  let savedPos = p.pos
+  if nodeSpace(p).ok or newline(p).ok:
+    p.pos = savedPos
+    return true
+
+  p.pos = savedPos
+  return false
+
+proc ty(p: Parser): ParseResult[tuple[beforeTyName: string, ty: Option[KdlIdentifier], afterTyName: string]] =
+  ## Parses a type annotation: (type)
+  let start = p.pos
+
+  if not p.tryChar('(').ok:
+    return failure[tuple[beforeTyName: string, ty: Option[KdlIdentifier], afterTyName: string]]()
+
+  let beforeTyName = wss(p)
+
+  let idRes = identifier(p)
+  if not idRes.ok:
+    p.addError("Expected type identifier")
+    # Try to recover
+    while not p.atEnd() and p.source[p.pos] != ')':
+      p.advance()
+    if not p.atEnd():
+      p.advance()
+    return success((beforeTyName, none(KdlIdentifier), ""), p.pos)
+
+  let afterTyName = wss(p)
+
+  if not p.expect(')').ok:
+    p.addError("Expected ')' after type annotation")
+    return failure[tuple[beforeTyName: string, ty: Option[KdlIdentifier], afterTyName: string]]()
+
+  return success((beforeTyName, some(idRes.value), afterTyName), p.pos)
+
+proc value(p: Parser): ParseResult[Option[InternalEntry]] =
+  ## Parses a value with optional type annotation
+  let start = p.pos
+
+  # Optional type annotation
+  var tyInfo: tuple[beforeTyName: string, ty: Option[KdlIdentifier], afterTyName: string]
+  var afterTy = ""
+
+  let tyRes = ty(p)
+  if tyRes.ok:
+    tyInfo = tyRes.value
+    afterTy = wss(p)
+  else:
+    tyInfo = ("", none(KdlIdentifier), "")
+
+  let valueStart = p.pos
+
+  # Try keyword
+  var valRes = keyword(p)
+  var repr = ""
+
+  if valRes.ok:
+    repr = p.source[valueStart ..< p.pos]
+  else:
+    # Try number
+    p.pos = valueStart
+    let numRes = parseNumber(p)
+    if numRes.ok:
+      valRes = success(numRes.value.value, p.pos)
+      repr = numRes.value.repr
+    else:
+      # Try string
+      p.pos = valueStart
+      let strRes = string(p)
+      if strRes.ok:
+        valRes = success(strRes.value.value, p.pos)
+        repr = strRes.value.repr
+      else:
+        # No valid value
+        return success(none(InternalEntry), p.pos)
+
+  # Check for value terminator
+  if not valueTerminator(p):
+    p.addError("Expected value terminator (space, newline, =, ), {, }, ;, or EOF)")
+
+  let format = some(KdlEntryFormat(
+    valueRepr: repr,
+    afterTy: afterTy,
+    beforeTyName: tyInfo.beforeTyName,
+    afterTyName: tyInfo.afterTyName,
+    leading: "",
+    trailing: "",
+    afterKey: "",
+    afterEq: "",
+    autoformatKeep: false
+  ))
+
+  let entry = initInternalEntry(
+    value = valRes.value,
+    ty = tyInfo.ty,
+    format = format,
+    span = some(p.getSpan(start))
+  )
+
+  return success(some(entry), p.pos)
+
+# Node parsing
+
+# slashdash moved to top of file
+
+proc nodeEntry(p: Parser): ParseResult[Option[InternalEntry]] =
+  ## Parses a node entry (argument or property)
+  let start = p.pos
+
+  # Leading whitespace/comments
+  let leading = wss(p)
+
+  # Check for slashdash
+  let slashdashRes = slashdash(p)
+  if slashdashRes.ok:
+    # Slashdashed entry - parse but don't return it
+    # First consume whitespace after slashdash
+    discard nodeSpace(p)
+
+    # Check if it's a children block (not an entry)
+    if not p.atEnd() and p.source[p.pos] == '{':
+      # This is slashdash for children, not an entry
+      # Don't consume it here - let the caller handle it
+      # Reset position to before slashdash
+      p.pos = start
+      return success(none(InternalEntry), p.pos)
+
+    # Try to parse as property (key=value) or just value
+    let savedPos = p.pos
+    # Try optional type annotation
+    discard ty(p)
+    discard wss(p)
+    # Try identifier
+    let keyRes = identifier(p)
+    if keyRes.ok:
+      discard wss(p)
+      # Check for '='
+      if p.tryChar('=').ok:
+        discard wss(p)
+        # It's a property, parse the value
+        discard value(p)
+        return success(none(InternalEntry), p.pos)
+    # Not a property, reset and parse as value
+    p.pos = savedPos
+    discard value(p)
+    return success(none(InternalEntry), p.pos)
+
+  # Try to parse as property (key=value)
+  let propStart = p.pos
+
+  # Optional type annotation for the key
+  var tyInfo: tuple[beforeTyName: string, ty: Option[KdlIdentifier], afterTyName: string]
+  var afterTy = ""
+
+  let tyRes = ty(p)
+  if tyRes.ok:
+    tyInfo = tyRes.value
+    afterTy = wss(p)
+  else:
+    tyInfo = ("", none(KdlIdentifier), "")
+
+  # Try to parse identifier
+  let keyRes = identifier(p)
+  if keyRes.ok:
+    let afterKey = wss(p)
+
+    # Check for '='
+    if p.tryChar('=').ok:
+      let afterEq = wss(p)
+
+      # Parse the value
+      let valStart = p.pos
+      let valRes = value(p)
+
+      if valRes.ok and valRes.value.isSome:
+        var entry = valRes.value.get
+        entry.name = some(keyRes.value)
+
+        # Update format with property-specific fields
+        if entry.format.isSome:
+          var fmt = entry.format.get
+          fmt.leading = leading
+          fmt.afterKey = afterKey
+          fmt.afterEq = afterEq
+          entry.format = some(fmt)
+
+        return success(some(entry), p.pos)
+
+  # Not a property, reset and try as argument
+  p.pos = propStart
+  let valRes = value(p)
+
+  if valRes.ok and valRes.value.isSome:
+    var entry = valRes.value.get
+    if entry.format.isSome:
+      var fmt = entry.format.get
+      fmt.leading = leading
+      entry.format = some(fmt)
+    return success(some(entry), p.pos)
+
+  return success(none(InternalEntry), p.pos)
+
+proc nodeChildren(p: Parser): ParseResult[seq[InternalNode]] =
+  ## Parses node children: { nodes }
+  let start = p.pos
+
+  if not p.tryChar('{').ok:
+    return failure[seq[InternalNode]]()
+
+  # Parse nodes inside children block
+  let nodesRes = nodes(p)
+
+  if not p.expect('}').ok:
+    p.addError("Expected '}' to close children block")
+    return failure[seq[InternalNode]]()
+
+  if nodesRes.ok:
+    return success(nodesRes.value, p.pos)
+  else:
+    return success(newSeq[InternalNode](), p.pos)
+
+proc baseNode(p: Parser): ParseResult[InternalNode] =
+  ## Parses a base node (without leading whitespace)
+  let start = p.pos
+
+  # Optional type annotation
+  var tyInfo: tuple[beforeTyName: string, ty: Option[KdlIdentifier], afterTyName: string]
+  var afterTy = ""
+
+  let tyRes = ty(p)
+  if tyRes.ok:
+    tyInfo = tyRes.value
+    let nsRes = nodeSpace(p)
+    if nsRes.ok:
+      afterTy = nsRes.value
+  else:
+    tyInfo = ("", none(KdlIdentifier), "")
+
+  # Node name
+  let nameRes = identifier(p)
+  if not nameRes.ok:
+    return failure[InternalNode]()
+
+  var entries: seq[InternalEntry] = @[]
+  var children: Option[seq[InternalNode]] = none(seq[InternalNode])
+  var beforeChildren = ""
+
+  # Parse entries and children
+  while true:
+    # Try node-space
+    let savedPos = p.pos
+    let nsRes = nodeSpace(p)
+    if nsRes.ok:
+      # Try to parse entry or children
+      let entryStartPos = p.pos
+      let entryRes = nodeEntry(p)
+      if entryRes.ok:
+        # Check if entry was actually parsed by seeing if position advanced
+        if entryRes.value.isSome or p.pos != entryStartPos:
+          # Entry was parsed OR position advanced (slashdash consumed something)
+          if entryRes.value.isSome:
+            entries.add(entryRes.value.get)
+          # Continue parsing even if it was a slashdashed (None) entry
+          continue
+
+      # Try children (don't reset position - we're already after node-space)
+      beforeChildren = nsRes.value
+
+      # Check for slashdash before children
+      let sdRes = slashdash(p)
+      if sdRes.ok:
+        # Slashdashed children - parse and discard
+        discard nodeSpace(p)
+        discard nodeChildren(p)
+        break
+
+      let childrenRes = nodeChildren(p)
+      if childrenRes.ok:
+        children = some(childrenRes.value)
+        break
+
+      # No entry or children, just whitespace - break
+      p.pos = savedPos
+      break
+    else:
+      # No more node-space, but still try children (can appear without space)
+      # Check for slashdash before children
+      let sdRes = slashdash(p)
+      if sdRes.ok:
+        # Slashdashed children - parse and discard
+        discard nodeSpace(p)
+        discard nodeChildren(p)
+        break
+
+      let childrenRes = nodeChildren(p)
+      if childrenRes.ok:
+        children = some(childrenRes.value)
+      break
+
+  let format = some(KdlNodeFormat(
+    leading: "",
+    trailing: "",
+    beforeTyName: tyInfo.beforeTyName,
+    afterTyName: tyInfo.afterTyName,
+    afterTy: afterTy,
+    beforeChildren: beforeChildren,
+    beforeTerminator: "",
+    terminator: "\n"
+  ))
+
+  let node = initInternalNode(
+    name = nameRes.value,
+    ty = tyInfo.ty,
+    entries = entries,
+    children = children,
+    format = format,
+    span = some(p.getSpan(start))
+  )
+
+  return success(node, p.pos)
+
+proc node(p: Parser): ParseResult[InternalNode] =
+  ## Parses a node with leading whitespace and terminator
+  let start = p.pos
+
+  # Leading whitespace/comments (may include slashdash comments)
+  var leading = ""
+  while true:
+    let lsRes = lineSpace(p)
+    if lsRes.ok:
+      leading.add(lsRes.value)
+      continue
+
+    # Try escline
+    let escRes = escline(p)
+    if escRes.ok:
+      leading.add(escRes.value)
+      continue
+
+    # Check for slashdash of an entire node
+    let sdRes = slashdash(p)
+    if sdRes.ok:
+      leading.add(sdRes.value)
+      # Consume whitespace after slashdash
+      let sdWs = lineSpace(p)
+      if sdWs.ok:
+        leading.add(sdWs.value)
+      # Parse and discard the slashdashed node
+      discard baseNode(p)
+      # Consume terminator of slashdashed node
+      discard wss(p)
+      if not p.atEnd():
+        let c = p.peek()
+        if c.isSome and c.get == ';':
+          p.advance()
+        else:
+          discard newline(p)
+    else:
+      break
+
+  # Parse the actual node
+  let nodeRes = baseNode(p)
+  if not nodeRes.ok:
+    return failure[InternalNode]()
+
+  var node = nodeRes.value
+
+  # Before terminator whitespace
+  var beforeTerminator = wss(p)
+
+  # Check for single-line comment before terminator
+  let slcRes = singleLineComment(p)
+  if slcRes.ok:
+    beforeTerminator.add(slcRes.value)
+
+  # Node terminator (semicolon, newline, or escline) - optional at EOF
+  var terminator = "\n"
+  if not p.atEnd():
+    let c = p.peek()
+    if c.isSome and c.get == ';':
+      p.advance()
+      terminator = ";"
+    else:
+      # Try escline first (backslash continuation)
+      let escRes = escline(p)
+      if escRes.ok:
+        terminator = escRes.value
+      else:
+        # Try regular newline
+        let nlRes = newline(p)
+        if nlRes.ok:
+          terminator = nlRes.value
+
+  # Trailing whitespace
+  let trailing = wss(p)
+
+  # Update format
+  if node.format.isSome:
+    var fmt = node.format.get
+    fmt.leading = leading
+    fmt.beforeTerminator = beforeTerminator
+    fmt.terminator = terminator
+    fmt.trailing = trailing
+    node.format = some(fmt)
+
+  return success(node, p.pos)
+
+proc nodes(p: Parser): ParseResult[seq[InternalNode]] =
+  ## Parses zero or more nodes
+  var result: seq[InternalNode] = @[]
+
+  # Skip leading line-space (including escline)
+  while true:
+    let lsRes = lineSpace(p)
+    if lsRes.ok:
+      continue
+
+    # Also try escline
+    let escRes = escline(p)
+    if escRes.ok:
+      continue
+
+    break
+
+  # Parse nodes
+  while not p.atEnd():
+    let savedPos = p.pos
+    let nodeRes = node(p)
+    if nodeRes.ok:
+      result.add(nodeRes.value)
+    else:
+      # No more valid nodes
+      p.pos = savedPos
+      break
+
+  # Trailing line-space (including escline)
+  while true:
+    let lsRes = lineSpace(p)
+    if lsRes.ok:
+      continue
+
+    # Also try escline
+    let escRes = escline(p)
+    if escRes.ok:
+      continue
+
+    break
+
+  return success(result, p.pos)
+
+proc document(p: Parser): ParseResult[seq[InternalNode]] =
+  ## Parses a complete KDL document
+  let start = p.pos
+
+  # Optional BOM (check without adding error)
+  if p.peekStr(3).isSome and p.peekStr(3).get == "\uFEFF":
+    p.advance(3)
+
+  # Parse nodes
+  return nodes(p)
+
+# Main entry point
+
+proc parseKdl*(source: string): KdlDoc =
+  ## Parses a KDL document from source string
+  ## Returns the parsed document or raises KdlParserError
+  var p = initParser(source)
+
+  let docRes = document(p)
+
+  if p.hasErrors():
+    let errMsg = p.getErrorMessage(source)
+    raise newException(KdlParserError, errMsg)
+
+  if not docRes.ok:
+    raise newException(KdlParserError, "Failed to parse KDL document")
+
+  # Convert internal representation to public API
+  return toPublicDoc(docRes.value)

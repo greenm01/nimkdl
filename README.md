@@ -1,4 +1,4 @@
-# Knot
+# nimkdl
 
 A KDL 2.0 document parser for Nim.
 
@@ -17,13 +17,13 @@ A KDL 2.0 document parser for Nim.
 ## Installation
 
 ```bash
-nimble install knot
+nimble install nimkdl
 ```
 
 ## Quick Start
 
 ```nim
-import knot
+import nimkdl
 
 # Parse KDL from string
 let doc = parseKdl("""
@@ -51,7 +51,7 @@ Learn more at [kdl.dev](https://kdl.dev)
 
 ## KDL 2.0 Support
 
-Knot implements the KDL 2.0 specification, including:
+nimkdl implements the KDL 2.0 specification, including:
 - Type annotations `(i32)123`, `(date)"2024-01-01"`
 - Keywords with `#` prefix: `#true`, `#false`, `#null`, `#inf`, `#nan`
 - Raw strings: `#"no\\escapes"#`

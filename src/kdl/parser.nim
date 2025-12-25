@@ -20,7 +20,7 @@ proc nodes(p: Parser): ParseResult[seq[InternalNode]]
 
 proc parseDecimalDigits(p: Parser, allowSign: bool = true): ParseResult[string] =
   var numStr = ""
-  if allowSign and not p.atEnd() and p.source[p.pos] in {'+', '-'}:
+  if allowSign and not p.atEnd() and (p.source[p.pos] == '+' or p.source[p.pos] == '-'):
     numStr.add(p.source[p.pos])
     p.advance()
 
@@ -47,7 +47,7 @@ proc parseDecimalDigitsInt(p: Parser, allowSign: bool = true): ParseResult[int64
   var result: int64 = 0
   var isNegative = false
 
-  if allowSign and not p.atEnd() and p.source[p.pos] in {'+', '-'}:
+  if allowSign and not p.atEnd() and (p.source[p.pos] == '+' or p.source[p.pos] == '-'):
     isNegative = (p.source[p.pos] == '-')
     p.advance()
 
@@ -107,6 +107,15 @@ proc unicodeSpace(p: Parser): ParseResult[string] =
   if p.atEnd():
     return failure[string]()
 
+  let c = p.source[p.pos]
+
+  # ASCII fast path (covers 99% of cases)
+  if c == ' ' or c == '\t':
+    let start = p.pos
+    p.pos += 1
+    return success(p.source[start ..< p.pos], p.pos)
+
+  # Unicode slow path
   var pos = p.pos
   let r = p.source.runeAt(pos)
 
@@ -762,16 +771,24 @@ proc identifierString(p: Parser): ParseResult[KdlVal] =
       if nextPos < p.source.len and p.source[nextPos] in Digits:
         return failure[KdlVal]()
 
-  var ident = ""
+  let identStart = p.pos
   while not p.atEnd():
+    let c = p.source[p.pos]
+
+    # ASCII fast path for common identifier characters
+    if (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+       (c >= '0' and c <= '9') or c in {'_', '-', '.', '!', '$', '%', '&', '*', '+', '<', '>', '?', '@', '^', '|', '~'}:
+      p.pos += 1
+      continue
+
     # Check for comment starts: // or /*
-    if p.source[p.pos] == '/':
+    if c == '/':
       let next = p.peek()
-      if next.isSome and next.get in {'/', '*'}:
+      if next.isSome and (next.get == '/' or next.get == '*'):
         # Stop before comment
         break
 
-    # Parse rune
+    # Unicode slow path (for non-ASCII characters)
     let r = p.source.runeAt(p.pos)
     let runeChar = r.int32
 
@@ -786,20 +803,20 @@ proc identifierString(p: Parser): ParseResult[KdlVal] =
       isValid = false
     # Check for ASCII disallowed characters
     elif runeChar < 128:
-      let c = char(runeChar)
-      if c in {'(', ')', '{', '}', '[', ']', ';', '=', '"', '\\', '#', '/', ' ', '\t', '\v', '\n', '\r'}:
+      # Already handled by fast path, but check remaining disallowed
+      if c in {'(', ')', '{', '}', '[', ']', ';', '=', '"', '\\', '#', ' ', '\t', '\v', '\n', '\r'}:
         isValid = false
 
     if isValid:
-      # Add the UTF-8 bytes for this rune
-      for i in 0 ..< r.size:
-        ident.add(p.source[p.pos + i])
       p.pos += r.size
     else:
       break
 
-  if ident.len == 0:
+  if p.pos == identStart:
     return failure[KdlVal]()
+
+  # Extract identifier with single slice
+  let ident = p.source[identStart ..< p.pos]
 
   # KDL v2: Reserved keywords cannot be used as bare identifiers
   # They must be quoted ("true") or use # prefix (#true for actual value)

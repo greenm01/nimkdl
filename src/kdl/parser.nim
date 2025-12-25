@@ -1451,6 +1451,15 @@ proc baseNode(p: Parser): ParseResult[InternalNode] =
       p.addError("Expected node name after type annotation")
     return failure[InternalNode]()
 
+  # Check for invalid characters immediately after node name (KDL v2 spec violation)
+  # This catches cases like "foo(bar)" or "foo{bar}" where special chars appear
+  # without whitespace, suggesting the identifier tried to continue invalidly
+  if not p.atEnd():
+    let nextChar = p.source[p.pos]
+    if nextChar in {'(', ')', '{', '}', '[', ']', '"', '\\'}:
+      p.addError("Unexpected character '" & nextChar & "' after node name (whitespace required)")
+      return failure[InternalNode]()
+
   var entries: seq[InternalEntry] = @[]
   var children: Option[seq[InternalNode]] = none(seq[InternalNode])
   var beforeChildren = ""

@@ -1334,7 +1334,7 @@ proc nodeEntry(p: Parser): ParseResult[Option[InternalEntry]] =
   # Try to parse as property (key=value)
   let propStart = p.pos
 
-  # Optional type annotation for the key
+  # Try to parse optional type annotation
   var tyInfo: tuple[beforeTyName: string, ty: Option[KdlIdentifier], afterTyName: string]
   var afterTy = ""
 
@@ -1352,6 +1352,12 @@ proc nodeEntry(p: Parser): ParseResult[Option[InternalEntry]] =
 
     # Check for '='
     if p.tryChar('=').ok:
+      # KDL v2: Type annotations are not allowed before property keys
+      if tyInfo.ty.isSome:
+        p.pos = propStart
+        p.addError("Type annotation not allowed before property key (only before values)")
+        return failure[Option[InternalEntry]]()
+
       let afterEq = wss(p)
 
       # Parse the value

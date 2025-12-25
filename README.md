@@ -205,7 +205,12 @@ let jsonDoc = parseJik("""
 """)
 ```
 
-See the [documentation](https://kdl-org.github.io/kdl-nim) for complete API reference.
+For complete API reference, generate documentation locally:
+```bash
+nimble docs
+```
+
+Or view the inline documentation in the source files.
 
 ## Credits
 

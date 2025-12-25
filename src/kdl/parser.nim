@@ -1252,6 +1252,23 @@ proc baseNode(p: Parser): ParseResult[InternalNode] =
       let childrenRes = nodeChildren(p)
       if childrenRes.ok:
         children = some(childrenRes.value)
+
+        # After children, check for slashdashed children without whitespace
+        # Example: node {} /-{}
+        let sdAfterRes = slashdash(p)
+        if sdAfterRes.ok:
+          # Consume any whitespace/newlines after slashdash
+          while true:
+            if nodeSpace(p).ok:
+              continue
+            if lineSpace(p).ok:
+              continue
+            if escline(p).ok:
+              continue
+            break
+          # Parse and discard the slashdashed children
+          discard nodeChildren(p)
+
         break
 
       # No entry or children, just whitespace - break

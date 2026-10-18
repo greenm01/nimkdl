@@ -1,6 +1,6 @@
 # Package
 packageName = "nimkdl"
-version = "2.1.0"
+version = "2.1.1"
 author = "niltempus"
 description = "KDL 2.0 document parser for Nim"
 license = "MIT"
@@ -11,8 +11,8 @@ skipFiles = @["src/nimkdl/query.nim", "src/nimkdl/schema.nim"]
 requires "nim >= 2.0.0"
 requires "bigints"
 # For proper unicode handling when printing errors
-requires "graphemes == 0.12.0"
-requires "unicodedb == 0.13.0"
+requires "graphemes >= 0.12.0"
+requires "unicodedb >= 0.13.0"
 
 # Optimization flags for release builds
 when not defined(debug):

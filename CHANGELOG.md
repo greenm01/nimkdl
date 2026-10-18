@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.1.1] - 2026-10-18
+
+### Changed
+- Relaxed `graphemes` and `unicodedb` from exact pins to lower bounds
+  (`>= 0.12.0`, `>= 0.13.0`) so downstream projects can resolve newer
+  versions, e.g. alongside `regex >= 0.26.1`. Tested with unicodedb 0.13.2
+  and 0.14.1.
+
 ## [2.0.0] - 2025-12-23
 
 ### Initial Release
